@@ -1,41 +1,16 @@
-# EditReward scorer — Qwen2.5-VL / MiMo-VL 7B multi-head reward model
-# for instruction-guided image editing evaluation.
+# EditReward scorer — vendored inference code under _editreward/.
 #
-# NOTE: On images where Ray runtime_env pip isolation is broken (no pip
-# in virtualenv), install these deps directly via the launcher script
-# (see launch_flux2klein_editreward_2node.sh). The envs file is still
-# required by the service config validator.
+# IMPORTANT: This file is intentionally EMPTY of pip packages. The reward
+# service config validator requires a runtime_env file to exist, but Ray's
+# runtime_env pip isolation is broken on the vllm-sglang-omni image (the
+# created virtualenv lacks pip). Instead, the launcher script installs all
+# dependencies directly into the main venv before starting the service.
 #
-# Install EditReward package from GitHub:
-#   editreward @ git+https://github.com/TIGER-AI-Lab/EditReward.git
-# Or add to PYTHONPATH from a local checkout.
-
-pyarrow<19
-datasets
-pillow
-openai
-megfile
-sentencepiece
-deepspeed
-fire
-omegaconf
-matplotlib
-peft
-trl==0.8.6
-tensorboard
-scipy
-transformers==4.57.0
-accelerate
-requests
-packaging
-pandas
-opencv-python
-einops
-timm
-huggingface_hub
-qwen-vl-utils
-av
-regex
-safetensors
-tqdm
-PyYAML
+# The vendored _editreward/ package needs only:
+#   transformers, safetensors, omegaconf, qwen-vl-utils, torchvision,
+#   numpy, packaging, requests, decord
+# (training-only deps like fire/matplotlib/datasets/deepspeed are NOT needed
+# because the vendored code strips all training imports.)
+#
+# Leaving this empty makes Ray create a bare venv (--system-site-packages)
+# without attempting any pip install, so the main-env deps are used.

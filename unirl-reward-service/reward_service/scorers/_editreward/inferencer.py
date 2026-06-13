@@ -139,6 +139,10 @@ class EditRewardInferencer:
                 is_train=False,
             )
         )
+        # output_dir is training-only; the config YAML may leave it null.
+        # Inference never writes here — default to /tmp to avoid os.path.join(None).
+        if not training_args.output_dir:
+            training_args.output_dir = "/tmp/editreward_output"
         training_args.output_dir = os.path.join(
             training_args.output_dir, config_path.split("/")[-1].split(".")[0]
         )
