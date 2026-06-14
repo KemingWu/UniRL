@@ -261,12 +261,15 @@ class LTX2Pipeline(Pipeline):
             sde_indices=sde_indices,
         )
 
-        # 6. Unpack + denormalize → 5D latents → VAE decode → video frames
+        # 6. Unpack + denormalize → 5D latents → VAE decode → video frames.
+        # The clean final latent is the last trajectory step (step T); the
+        # segment stores it sparsely, retrieved via ``latents_at``.
         _, latent_t, latent_h, latent_w = self.latent_shape(
             model_config=self.config, sampling_spec=params
         )
+        final_latents = segment.latents_at(int(params.num_inference_steps))
         unpacked = self._unpack_latents(
-            segment.final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t
+            final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t
         )
         unpacked = self._denormalize_latents(unpacked)
         decoded_video = self.vae_decode.decode(unpacked)

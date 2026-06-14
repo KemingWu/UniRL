@@ -28,6 +28,7 @@ from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment, make_video_segment
+from unirl.types.trajectory_store import compute_trajectory_positions
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import LTX2Bundle
@@ -208,29 +209,43 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         eta = float(params.eta)
         latent_t, latent_h, latent_w = self._latent_geometry(params)
 
-        # Determine SDE step set
+        device = initial_latents.device
         num_steps = len(sigmas) - 1
-        sde_set: Set[int] = set(sde_indices) if sde_indices else set(range(num_steps))
+        sigmas = sigmas.to(device)
+        self.strategy.init_schedule(sigmas)
 
-        # Trajectory storage
-        latent_trajectory = []
-        log_probs = []
+        # SDE step set: which steps record log-probs (default: all).
+        sde_set: Set[int] = set(int(i) for i in sde_indices) if sde_indices else set(range(num_steps))
+        sde_sorted: List[int] = sorted(sde_set)
 
-        x = initial_latents
+        # Sparse trajectory storage: SDE transition endpoints (k, k+1) plus the
+        # final step T so VAE decode always has the clean latent. Stored as a
+        # (position, latent) list → packed into LatentSegment.{latents,indices},
+        # which ``latents_at`` / ``replay`` index by step. Mirrors WAN21.
+        needed: Set[int] = set(compute_trajectory_positions(sde_set, num_steps))
+        needed.add(num_steps)
+
+        x = initial_latents.to(dtype=self.trajectory_dtype)
+        stored_pairs: List[tuple] = []
+        if 0 in needed:
+            stored_pairs.append((0, x.detach().clone()))
+        sde_logp_list: List[torch.Tensor] = []
+
         autocast_ctx = (
             torch.autocast("cuda", dtype=self.autocast_dtype) if self.autocast_dtype != torch.float32 else nullcontext()
         )
+        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
 
         with autocast_ctx:
             for step_idx in range(num_steps):
-                sigma = sigmas[step_idx].expand(x.shape[0])
-                sigma_next = sigmas[step_idx + 1].expand(x.shape[0])
-                is_sde = step_idx in sde_set
+                sigma = sigmas[step_idx].to(device)
+                sigma_next = sigmas[step_idx + 1].to(device)
+                step_eta = eta if step_idx in sde_set else 0.0
 
                 noise_pred = self.step_kernel.predict_noise(
                     self.bundle,
                     x,
-                    sigma,
+                    sigma.expand(x.shape[0]),
                     conditions,
                     guidance_scale=guidance_scale,
                     latent_num_frames=latent_t,
@@ -238,26 +253,37 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     latent_width=latent_w,
                 )
 
-                if is_sde:
-                    # SDE step with log-prob for RL training
-                    x_next, lp = self.strategy.denoise_with_logp(x, noise_pred, sigma, sigma_next, eta=eta)
-                    latent_trajectory.append(x.to(self.trajectory_dtype))
-                    log_probs.append(lp.to(self.logprob_dtype))
-                else:
-                    # ODE step (deterministic, no log-prob)
-                    x_next = self.strategy.denoise(x, noise_pred, sigma, sigma_next, eta=0.0)
+                # strategy.denoise → (prev_sample, log_prob, prev_sample_mean).
+                # log_prob is None for ODE (eta=0) steps.
+                x_next, log_prob, _ = self.strategy.denoise(
+                    noise_pred=noise_pred,
+                    sample=x,
+                    sigma=sigma,
+                    sigma_next=sigma_next,
+                    eta=step_eta,
+                    sigma_max=sigma_max,
+                    step_index=step_idx,
+                )
+                x = x_next.to(dtype=self.trajectory_dtype)
 
-                x = x_next
+                if (step_idx + 1) in needed:
+                    stored_pairs.append((step_idx + 1, x.detach().clone()))
+                if log_prob is not None:
+                    sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # Build segment
-        segment = make_video_segment(
-            final_latents=x,
-            latent_trajectory=latent_trajectory if latent_trajectory else None,
-            sde_logp=torch.stack(log_probs, dim=1) if log_probs else None,
-            sde_indices=sorted(sde_set) if sde_set else None,
+        positions = [p for p, _ in stored_pairs]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
+        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
+        sde_indices_t = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
+        indices_t = torch.tensor(positions, dtype=torch.long, device=device)
+
+        return make_video_segment(
+            latents=latents_stacked,
             sigmas=sigmas,
+            indices=indices_t,
+            sde_logp=sde_logp,
+            sde_indices=sde_indices_t,
         )
-        return segment
 
     def replay(
         self,
@@ -265,33 +291,52 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         *,
         segment: LatentSegment,
         params: DiffusionSamplingParams,
-        step_indices: List[int],
+        step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Replay specific SDE steps to recompute log-probs for training.
+        """Segment-based log-prob replay over the rollout's SDE transitions.
 
-        Used by DiffusionGRPO to compute new_logp (or replay old_logp).
+        For each target SDE step ``k`` we re-run the model at the stored
+        ``sample = latents_at(k)`` and evaluate the log-prob of the stored
+        transition to ``prev_sample = latents_at(k+1)`` (no fresh noise —
+        ``strategy.denoise`` with ``prev_sample`` set is replay mode). Used by
+        FlowGRPO for both the frozen π_old anchor and the trainable new_logp.
+        Returns ``log_probs`` ``[B, len(target)]`` and ``prev_sample_means``
+        for the KL penalty. Mirrors WAN21.
         """
+        if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
+            raise ValueError("LTX2DiffusionStage.replay: segment.sde_indices / latents / sigmas missing")
+
         guidance_scale = float(params.guidance_scale)
         eta = float(params.eta)
-        sigmas = segment.sigmas
         latent_t, latent_h, latent_w = self._latent_geometry(params)
 
-        log_probs = []
+        sde_set = set(int(i) for i in segment.sde_indices.tolist())
+        target = [int(i) for i in (step_indices if step_indices is not None else segment.sde_indices.tolist())]
+        bad = [i for i in target if i not in sde_set]
+        if bad:
+            raise ValueError(f"LTX2DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}")
+
+        device = segment.latents.device
+        sigmas = segment.sigmas.to(device)
+        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
+
+        log_probs: List[torch.Tensor] = []
+        prev_sample_means: List[torch.Tensor] = []
         autocast_ctx = (
             torch.autocast("cuda", dtype=self.autocast_dtype) if self.autocast_dtype != torch.float32 else nullcontext()
         )
 
         with autocast_ctx:
-            for local_idx, step_idx in enumerate(step_indices):
-                # Retrieve cached latent at this step
-                x = segment.latent_trajectory[:, local_idx].to(device=self.bundle.device, dtype=self.autocast_dtype)
-                sigma = sigmas[step_idx].expand(x.shape[0])
-                sigma_next = sigmas[step_idx + 1].expand(x.shape[0])
+            for step_idx in target:
+                sigma = sigmas[step_idx].to(dtype=torch.float32)
+                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
+                sample = segment.latents_at(step_idx).to(device=device, dtype=self.autocast_dtype)
+                prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.autocast_dtype)
 
                 noise_pred = self.step_kernel.predict_noise(
                     self.bundle,
-                    x,
-                    sigma,
+                    sample,
+                    sigma.expand(sample.shape[0]),
                     conditions,
                     guidance_scale=guidance_scale,
                     latent_num_frames=latent_t,
@@ -299,10 +344,28 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     latent_width=latent_w,
                 )
 
-                _, lp = self.strategy.denoise_with_logp(x, noise_pred, sigma, sigma_next, eta=eta)
-                log_probs.append(lp)
+                _, log_prob, prev_mean = self.strategy.denoise(
+                    noise_pred=noise_pred,
+                    sample=sample,
+                    sigma=sigma,
+                    sigma_next=sigma_next,
+                    eta=eta,
+                    prev_sample=prev_sample,
+                    sigma_max=sigma_max,
+                    step_index=step_idx,
+                )
+                if log_prob is None:
+                    raise RuntimeError(
+                        f"LTX2DiffusionStage.replay: strategy returned None log-prob at step_index={step_idx} "
+                        f"(deterministic mode); replay requires a stochastic SDE strategy."
+                    )
+                log_probs.append(log_prob)
+                if prev_mean is not None:
+                    prev_sample_means.append(prev_mean)
 
-        return ReplayResult(log_probs=torch.stack(log_probs, dim=1).to(self.logprob_dtype))
+        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
+        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
 
 __all__ = ["LTX2DiffusionStep", "LTX2DiffusionStage"]
