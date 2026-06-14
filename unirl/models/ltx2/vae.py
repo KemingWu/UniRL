@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from unirl.types.primitives import Video, Videos
+
 if TYPE_CHECKING:
     from .bundle import LTX2Bundle
 
@@ -23,21 +25,40 @@ class LTX2VAEDecodeStage:
         self.device = bundle.device
 
     @torch.no_grad()
-    def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode video latents → pixel frames.
+    def decode(self, latents: torch.Tensor) -> Videos:
+        """Decode (already-denormalized) video latents → packed ``Videos``.
 
         Args:
-            latents: (B, C, T_lat, H_lat, W_lat) in VAE latent space.
+            latents: (B, C, T_lat, H_lat, W_lat) in VAE latent space,
+                ALREADY denormalized by the pipeline (``_denormalize_latents``).
 
         Returns:
-            Video frames (B, C, T, H, W) in [0, 1] float range.
+            ``Videos`` (varlen-packed) with per-frame values in ``[0, 1]``.
         """
-        # LTX2 VAE expects latents scaled by the model's scale factor
-        latents = latents.to(dtype=self.vae.dtype)
-        frames = self.vae.decode(latents).sample
-        # Clamp to [0, 1]
-        frames = frames.clamp(0.0, 1.0)
-        return frames.to(self.dtype)
+        # Decode in fp32: LTX2's VAE decoder (like most) is numerically
+        # unstable in bf16. Mirror WAN21VAEDecodeStage.
+        vae = self.vae
+        latents_f32 = latents.to(torch.float32)
+
+        # The LTX2 VAE is timestep-conditioned: its decoder multiplies a
+        # required ``temb`` by a scale factor, so passing ``None`` crashes
+        # (None * Parameter). diffusers' pipeline feeds decode_timestep=0.0
+        # (and decode_noise_scale defaults to it → the pre-decode noise
+        # injection is a no-op), so a zeros timestep reproduces inference.
+        timestep = None
+        if bool(getattr(vae.config, "timestep_conditioning", False)):
+            timestep = torch.zeros(latents_f32.shape[0], device=latents_f32.device, dtype=latents_f32.dtype)
+
+        decoded = vae.to(torch.float32).decode(latents_f32, timestep, return_dict=False)[0]
+
+        # Decoder emits [B, C, T, H, W] in [-1, 1]; normalize to [0, 1].
+        decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0).to(self.dtype)
+
+        # Pack into the varlen ``Videos`` primitive: ``Video.frames`` is
+        # [T, C, H, W], so permute each sample (C, T, H, W) → (T, C, H, W)
+        # and let ``Videos.from_list`` concat along T (computing cu_seqlens).
+        videos = [Video(frames=decoded[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(decoded.shape[0]))]
+        return Videos.from_list(videos)
 
 
 class LTX2VAEEncodeStage:

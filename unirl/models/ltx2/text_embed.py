@@ -34,43 +34,53 @@ class LTX2TextEmbedStage:
         texts: Texts,
         negative_texts: Optional[Texts] = None,
     ) -> dict:
-        """Encode prompts → TextEmbedCondition for video (and optionally audio).
+        """Encode prompts → TextEmbedCondition for video (and audio).
 
-        Returns a dict with keys: 'text', optionally 'audio_text',
-        'negative_text', 'negative_audio_text'.
+        LTX-2.0 ALWAYS routes Gemma hidden states through the text connectors
+        (the DiT was trained on connector outputs, not raw Gemma). Returns a
+        dict with keys: 'text', 'audio_text', optionally 'negative_text',
+        'negative_audio_text'.
         """
-        prompt_embeds, attention_mask = self._encode_prompts(texts.texts)
+        if self.connectors is None:
+            raise RuntimeError(
+                "LTX2TextEmbedStage: bundle.connectors is None. LTX-2.0 requires "
+                "the LTX2TextConnectors; the DiT cannot consume raw Gemma hidden "
+                "states. Ensure the checkpoint's 'connectors' subfolder loaded."
+            )
 
-        result = {}
+        packed_hidden, attention_mask = self._encode_prompts(texts.texts)
+        video_embeds, audio_embeds, conn_mask = self._apply_connectors(packed_hidden, attention_mask)
 
-        if self.connectors is not None:
-            # LTX-2.3 path: route through connectors
-            video_embeds, audio_embeds, connector_mask = self._apply_connectors(prompt_embeds, attention_mask)
-            result["text"] = TextEmbedCondition(embeds=video_embeds, attn_mask=connector_mask)
-            result["audio_text"] = TextEmbedCondition(embeds=audio_embeds, attn_mask=connector_mask)
-        else:
-            # LTX-2.0 path: raw embeddings (caption_projection is on transformer)
-            result["text"] = TextEmbedCondition(embeds=prompt_embeds, attn_mask=attention_mask)
+        result = {
+            "text": TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask),
+            "audio_text": TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
+        }
 
         # Negative prompts for CFG
         if negative_texts is not None:
-            neg_embeds, neg_mask = self._encode_prompts(negative_texts.texts)
-            if self.connectors is not None:
-                neg_video, neg_audio, neg_conn_mask = self._apply_connectors(neg_embeds, neg_mask)
-                result["negative_text"] = TextEmbedCondition(embeds=neg_video, attn_mask=neg_conn_mask)
-                result["negative_audio_text"] = TextEmbedCondition(embeds=neg_audio, attn_mask=neg_conn_mask)
-            else:
-                result["negative_text"] = TextEmbedCondition(embeds=neg_embeds, attn_mask=neg_mask)
+            neg_packed, neg_mask = self._encode_prompts(negative_texts.texts)
+            neg_video, neg_audio, neg_conn_mask = self._apply_connectors(neg_packed, neg_mask)
+            result["negative_text"] = TextEmbedCondition(embeds=neg_video, attn_mask=neg_conn_mask)
+            result["negative_audio_text"] = TextEmbedCondition(embeds=neg_audio, attn_mask=neg_conn_mask)
 
         return result
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize and encode through Gemma3."""
+        """Tokenize and encode through Gemma3, returning the STACKED all-layers
+        packed hidden states ``(B, seq, caption_channels * num_layers)`` that
+        the text connector expects (mirrors diffusers ``_get_gemma_prompt_embeds``).
+        """
+        # Gemma expects LEFT padding for chat-style prompts (diffusers sets this).
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
+
         inputs = self.tokenizer(
-            prompts,
+            [p.strip() for p in prompts],
             padding="max_length",
             max_length=self.max_sequence_length,
             truncation=True,
+            add_special_tokens=True,
             return_tensors="pt",
         ).to(self.device)
 
@@ -79,25 +89,31 @@ class LTX2TextEmbedStage:
             attention_mask=inputs.attention_mask,
             output_hidden_states=True,
         )
-        # Use last hidden state as text embeddings
-        hidden_states = outputs.hidden_states[-1]  # (B, seq, D)
-        return hidden_states.to(self.dtype), inputs.attention_mask
+        # Stack ALL hidden layers (embedding + each block) on a new trailing
+        # axis, then flatten into the channel dim → (B, seq, C * num_layers).
+        # This is the connector's expected ``text_encoder_dim`` input.
+        stacked = torch.stack(outputs.hidden_states, dim=-1)  # (B, seq, C, L)
+        packed = stacked.flatten(2, 3).to(self.dtype)  # (B, seq, C*L)
+        return packed, inputs.attention_mask
 
     def _apply_connectors(
         self,
-        hidden_states: torch.Tensor,
+        packed_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Route Gemma3 outputs through connectors → video + audio embeddings."""
-        # Connector outputs video and audio projections
-        connector_out = self.connectors(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
+        """Route packed Gemma hidden states through LTX2TextConnectors.
+
+        ``LTX2TextConnectors.forward(text_encoder_hidden_states, attention_mask,
+        padding_side="left")`` returns a 3-tuple
+        ``(video_text_embedding, audio_text_embedding, binary_attn_mask)``.
+        """
+        padding_side = getattr(self.tokenizer, "padding_side", "left")
+        video_embeds, audio_embeds, conn_mask = self.connectors(
+            packed_hidden,
+            attention_mask,
+            padding_side=padding_side,
         )
-        video_embeds = connector_out.video_features  # (B, seq, D_video)
-        audio_embeds = connector_out.audio_features  # (B, seq, D_audio)
-        out_mask = connector_out.attention_mask  # (B, seq)
-        return video_embeds, audio_embeds, out_mask
+        return video_embeds, audio_embeds, conn_mask
 
 
 __all__ = ["LTX2TextEmbedStage"]

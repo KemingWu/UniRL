@@ -103,18 +103,17 @@ class LTX2Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        # Connectors (Gemma → video/audio embedding projection, frozen)
-        connectors: Optional[nn.Module] = None
-        try:
-            from diffusers.pipelines.ltx2.connectors import LTX2Connector
+        # Connectors (Gemma per-layer hidden states → video/audio text
+        # embeddings, frozen). REQUIRED for LTX-2.0: the DiT was trained on
+        # connector outputs, not raw Gemma hidden states — diffusers declares
+        # ``connectors`` in the pipeline's component sequence. The class is
+        # ``LTX2TextConnectors`` (NOT ``LTX2Connector``, which does not exist).
+        from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
-            connectors = (
-                LTX2Connector.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(device).eval()
-            )
-            connectors.requires_grad_(False)
-        except (ImportError, OSError):
-            # LTX-2.0 may not have connectors subfolder — uses caption_projection instead
-            pass
+        connectors = (
+            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(device).eval()
+        )
+        connectors.requires_grad_(False)
 
         # Scheduler
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")

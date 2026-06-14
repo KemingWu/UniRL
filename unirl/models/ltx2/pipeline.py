@@ -18,7 +18,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts, Videos
+from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import get_diffusion_params
@@ -205,9 +205,15 @@ class LTX2Pipeline(Pipeline):
         # Determine mode
         has_image = isinstance(images, Images)
 
-        # 1. Text embedding
+        # 1. Text embedding. CFG empty-negative: LTX-2's diffusers pipeline
+        # defaults negative_prompt to "" when guidance is on, so the model sees
+        # its trained unconditional embedding. Without this, predict_noise would
+        # skip the CFG branch entirely (negative_text is None) and guidance_scale
+        # would be a silent no-op.
         negative_texts = req.primitives.get("negative_text")
         neg = negative_texts if isinstance(negative_texts, Texts) else None
+        if neg is None and float(params.guidance_scale) > 1.0:
+            neg = Texts(texts=[""] * len(texts.texts))
         embed_result = self.text_embed.encode(texts, negative_texts=neg)
 
         # 2. Build conditions
@@ -272,19 +278,23 @@ class LTX2Pipeline(Pipeline):
             final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t
         )
         unpacked = self._denormalize_latents(unpacked)
-        decoded_video = self.vae_decode.decode(unpacked)
-        decoded = Videos(frames=decoded_video)
+        decoded = self.vae_decode.decode(unpacked)  # → varlen-packed Videos
 
-        # 7. Build response
+        # 7. Build response. ``parent_ids=req.group_ids`` makes sibling samples
+        # of one prompt a GRPO group (RolloutTrack.group_ids is a derived
+        # read-only property — NOT a constructor arg). ``decoded`` is the single
+        # Videos primitive for this track (the reward service reads it directly),
+        # not a modality-keyed dict. Track key ``"video"`` matches the WAN21
+        # video convention.
         track = RolloutTrack(
             sample_ids=list(req.sample_ids),
-            group_ids=list(req.group_ids),
+            parent_ids=list(req.group_ids),
             conditions=conditions.to_dict(),
             segment=segment,
-            decoded={"video": decoded},
+            decoded=decoded,
         )
 
-        return RolloutResp(tracks={"diffusion": track})
+        return RolloutResp(tracks={"video": track})
 
 
 __all__ = ["LTX2Pipeline"]
