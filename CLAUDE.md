@@ -109,9 +109,9 @@ Local skills currently in this repo:
 
 | Task Flag | Status | What It's Testing |
 |---|---|---|
-| `ltx2_t2v_dancegrpo_trainside_lora32_33f_10step_0613f_mycode` | RESOURCE_WAITING | LTX2 T2V DanceGRPO trainside. Fixed: get_object, AutoencoderKLLTX2Video, Gemma3ForConditionalGeneration, self.shift, @dataclass on LTX2Conditions, **noise-recipe wiring (latent_shape + pack/unpack/denormalize) → fixes `initial_latents must be provided`** |
+| `ltx2_t2v_dancegrpo_trainside_lora32_33f_10step_0614a_mycode` | SUBMITTED (0614, instance 8b1d80719eb5e036019ec52c45d82159) | LTX2 T2V DanceGRPO trainside. Verifies the noise-recipe fix. Prior `0613f` ENDed with `initial_latents must be provided`. Fixed across this run: get_object, AutoencoderKLLTX2Video, Gemma3ForConditionalGeneration, self.shift, @dataclass on LTX2Conditions, **noise-recipe wiring (latent_shape + pack/unpack/denormalize) → fixes `initial_latents must be provided`**. Code committed as `fcb93b0` on `feat/ltx2-editreward-support`. |
 | `flux2klein_4b_editreward_0613i_mycode` | RUNNING | Flux2Klein 4B + EditReward. New: ckpt save (adapter, every 100), input+output image side-by-side in wandb media. Fixed: data paths (jsonl rewritten to absolute) |
-| `hi3_it2i_dancegrpo_editreward_mimo_fsdp_0613f_2node` | RUNNING | HI3 80B it2i editreward, 2-node (node0=reward, node1=train). Fixed: ENTRY=train_diffusion (not train_unified_model), 2-node single-train-node pattern (bypasses Ray head IP issue) |
+| `hi3_it2i_dancegrpo_editreward_mimo_fsdp_0614a_2node` | SUBMITTED (0614) | HI3 80B it2i editreward, 2-node (node0=reward, node1=train). Prior run ENDed at rollout with `AttributeError: 'HunyuanImage3Config' object has no attribute 'model_version'` (ckpt remote `load_tokenizer` reads `self.config.model_version`, never defined). Fixed via `_ensure_tokenizer_loaded` backfill. Also: ENTRY=train_diffusion, 2-node single-train-node pattern (bypasses Ray head IP issue). |
 
 ### Key Code Changes in My_Code/UniRL (uncommitted)
 
@@ -122,6 +122,7 @@ Local skills currently in this repo:
 5. **unirl/types/media_preview.py**: Input+output image side-by-side concat for image-edit tasks (`_hconcat_pil` + `req.primitives["image"]` lookup)
 6. **examples/diffusion/flux2_klein/flux2_klein_4b_editreward.yaml**: Added `save_interval/save_mode/save_dir` (ckpt saving, adapter mode, every 100 rollouts)
 7. **datasets/image_edit/train.jsonl + test.jsonl**: Rewritten `data/` relative URIs to absolute `/apdcephfs_hldy2/share_305110755/hunyuan/kmwu/datasets/...` (originals backed up as .bak)
+8. **unirl/models/hunyuan_image3/bundle.py + text_embed.py**: Added `_ensure_tokenizer_loaded(transformer, tokenizer)` helper — backfills `transformer.config.model_version` (placeholder `"3.0"`) before the ckpt's `load_tokenizer`, which reads `self.config.model_version` but neither the config class nor config.json define it (the value is pass-through-only into the tokenizer's ignored `**kwargs`). Replaces the two raw `load_tokenizer` call sites. **Fixes `AttributeError: 'HunyuanImage3Config' object has no attribute 'model_version'`.**
 
 ### Job Scripts (in /apdcephfs_hldy/private_charlesswu/workspace/jobs/reproduce_scripts/jobs/)
 

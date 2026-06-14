@@ -23,7 +23,7 @@ import torch
 
 from unirl.types.primitives import Texts
 
-from .bundle import HunyuanImage3Bundle
+from .bundle import HunyuanImage3Bundle, _ensure_tokenizer_loaded
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
@@ -115,8 +115,9 @@ class HunyuanImage3TextEmbedStage:
 
         # Ensure the tokenizer wrapper is loaded -- AutoModelForCausalLM
         # leaves ``_tkwrapper`` as None until ``load_tokenizer`` is called.
-        if getattr(transformer, "_tkwrapper", None) is None:
-            transformer.load_tokenizer(bundle.tokenizer)
+        # ``_ensure_tokenizer_loaded`` backfills config.model_version first
+        # (the ckpt's load_tokenizer reads it but the config never defines it).
+        _ensure_tokenizer_loaded(transformer, bundle.tokenizer)
 
         out = transformer._tkwrapper.apply_chat_template(
             batch_prompt=prompts,
