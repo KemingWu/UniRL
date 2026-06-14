@@ -25,20 +25,23 @@ from unirl.types.sampling import get_diffusion_params
 
 from .bundle import LTX2Bundle
 from .conditions import LTX2Conditions
-from .config import LTX2PipelineConfig
+from .config import (
+    LTX2_LATENT_CHANNELS,
+    LTX2_SPATIAL_COMPRESSION,
+    LTX2_TEMPORAL_COMPRESSION,
+    LTX2PipelineConfig,
+)
 from .diffusion import LTX2DiffusionStage
 from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
 
-# LTX-2 3D-VAE geometry (fixed for the LTX-2 / LTX-2.3 family): 32x spatial,
-# 8x temporal compression, 128 latent channels. These constants are the single
-# source of truth for the driver-side ``latent_shape`` recipe AND the in-engine
-# unpack dims — they MUST match or the regenerated x_T won't round-trip.
-_LTX2_SPATIAL_COMPRESSION = 32
-_LTX2_TEMPORAL_COMPRESSION = 8
-_LTX2_LATENT_CHANNELS = 128
+# LTX-2 3D-VAE geometry constants now live in config.py (shared with the
+# diffusion stage). Local aliases kept for readability in this module.
+_LTX2_SPATIAL_COMPRESSION = LTX2_SPATIAL_COMPRESSION
+_LTX2_TEMPORAL_COMPRESSION = LTX2_TEMPORAL_COMPRESSION
+_LTX2_LATENT_CHANNELS = LTX2_LATENT_CHANNELS
 
 
 class LTX2Pipeline(Pipeline):

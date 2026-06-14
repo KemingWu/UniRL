@@ -14,6 +14,14 @@ from typing import Any, Optional
 
 from unirl.config.validation import validate_precision_type
 
+# LTX-2 3D-VAE geometry (fixed for the LTX-2 / LTX-2.3 family): 32x spatial,
+# 8x temporal compression, 128 latent channels. Single source of truth shared
+# by the pipeline (driver ``latent_shape`` + unpack) and the diffusion stage
+# (per-step RoPE coord geometry). Module-level so both import without a cycle.
+LTX2_SPATIAL_COMPRESSION = 32
+LTX2_TEMPORAL_COMPRESSION = 8
+LTX2_LATENT_CHANNELS = 128
+
 
 @dataclass
 class LTX2PipelineConfig:
