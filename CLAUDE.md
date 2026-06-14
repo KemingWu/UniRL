@@ -102,3 +102,39 @@ Local skills currently in this repo:
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Session State (2026-06-14)
+
+### Running Jobs (check status with `taiji_client trl`)
+
+| Task Flag | Status | What It's Testing |
+|---|---|---|
+| `ltx2_t2v_dancegrpo_trainside_lora32_33f_10step_0613f_mycode` | RESOURCE_WAITING | LTX2 T2V DanceGRPO trainside. Fixed: get_object, AutoencoderKLLTX2Video, Gemma3ForConditionalGeneration, self.shift, @dataclass on LTX2Conditions, **noise-recipe wiring (latent_shape + pack/unpack/denormalize) → fixes `initial_latents must be provided`** |
+| `flux2klein_4b_editreward_0613i_mycode` | RUNNING | Flux2Klein 4B + EditReward. New: ckpt save (adapter, every 100), input+output image side-by-side in wandb media. Fixed: data paths (jsonl rewritten to absolute) |
+| `hi3_it2i_dancegrpo_editreward_mimo_fsdp_0613f_2node` | RUNNING | HI3 80B it2i editreward, 2-node (node0=reward, node1=train). Fixed: ENTRY=train_diffusion (not train_unified_model), 2-node single-train-node pattern (bypasses Ray head IP issue) |
+
+### Key Code Changes in My_Code/UniRL (uncommitted)
+
+1. **unirl/trainer/diffusion.py**: `get_object` instead of `get_class` in `_resolve_noise_latent_shape` (fixes factory-method `_target_` like `LTX2Pipeline.from_bundle`)
+2. **unirl/models/ltx2/bundle.py**: `AutoencoderKLLTX2Video` (was wrong `AutoencoderKLLTX2`), `Gemma3ForConditionalGeneration` (was wrong `GemmaForCausalLM`)
+3. **unirl/models/ltx2/pipeline.py**: Added `self.shift = config.shift` (engine needs it for FlowMatchSchedulePolicy). Wired the driver x_T noise recipe: added `latent_shape` classmethod (5D `(128, T_lat, H_lat, W_lat)`, 32x spatial/8x temporal), pack/unpack (`_pack_latents`/`_unpack_latents` from diffusers), `_denormalize_latents`, and `_patch_sizes`. `generate` now regenerates x_T via `NoiseRecipe.from_rollout_req(req).resolve()` (raw 5D noise → pack → diffuse → unpack → denormalize → VAE decode) instead of requiring a pre-shipped `request_conditions['initial_latents']`. **Fixes `ValueError: initial_latents must be provided`.**
+4. **unirl/models/ltx2/conditions.py**: Added `@dataclass` decorator + `from dataclasses import dataclass` (was missing, breaks Batch serialization)
+5. **unirl/types/media_preview.py**: Input+output image side-by-side concat for image-edit tasks (`_hconcat_pil` + `req.primitives["image"]` lookup)
+6. **examples/diffusion/flux2_klein/flux2_klein_4b_editreward.yaml**: Added `save_interval/save_mode/save_dir` (ckpt saving, adapter mode, every 100 rollouts)
+7. **datasets/image_edit/train.jsonl + test.jsonl**: Rewritten `data/` relative URIs to absolute `/apdcephfs_hldy2/share_305110755/hunyuan/kmwu/datasets/...` (originals backed up as .bak)
+
+### Job Scripts (in /apdcephfs_hldy/private_charlesswu/workspace/jobs/reproduce_scripts/jobs/)
+
+| File | Purpose |
+|---|---|
+| `launch_ltx2_t2v_mycode.sh` | LTX2 trainside, My_Code checkout, installs local diffusers |
+| `launch_flux2klein_editreward_2node_mycode.sh` | Flux2Klein 2-node, My_Code checkout |
+| `launch_hi3_it2i_editreward_2node_mycode.sh` | HI3 2-node (node0=reward, node1=train_diffusion), My_Code checkout |
+| `launch_hi3_it2i_editreward_4node.sh` | HI3 4-node (modified: shared-file head IP broadcast + NODE_IP export + matching runner IP algo). NOT WORKING yet — use 2-node instead |
+
+### Known Issues / Next Steps
+
+- **hi3 4-node**: Ray head IP resolution still broken in practice (works in theory after fix, but never got a clean log to confirm). 2-node bypasses it. If 80B OOMs on single node, will need to revisit.
+- **LTX2 dynamic shift**: Currently uses static `shift=1.0` (config default). LTX-2 docs say "dynamic shift based on resolution". May need `build_schedule_policy()` for optimal quality.
+- **LTX2 connector**: `from diffusers.pipelines.ltx2.connectors import LTX2Connector` is wrong class name (should be `LTX2ConnectorTransformer1d`), but wrapped in try/except so doesn't crash — connector just won't load.
+- **Checkpoints saved to**: `/apdcephfs_hldy/private_charlesswu/workspace/jobs/checkpoints/flux2klein_4b_editreward/`

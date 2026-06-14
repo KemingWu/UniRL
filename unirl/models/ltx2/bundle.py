@@ -63,9 +63,9 @@ class LTX2Bundle(Bundle):
     @classmethod
     def from_config(cls, config: LTX2PipelineConfig) -> "LTX2Bundle":
         """Load all LTX-2 components from a HuggingFace checkpoint."""
-        from diffusers import AutoencoderKLLTX2, LTX2VideoTransformer3DModel
+        from diffusers import AutoencoderKLLTX2Video, LTX2VideoTransformer3DModel
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-        from transformers import AutoTokenizer, GemmaForCausalLM
+        from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
         path = config.pretrained_model_ckpt_path
         vae_path = config.vae_ckpt_path or path
@@ -86,12 +86,18 @@ class LTX2Bundle(Bundle):
         transformer = transformer.to(device, dtype=dtype)
 
         # Video VAE (frozen)
-        vae = AutoencoderKLLTX2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+        vae = AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
         vae.requires_grad_(False)
 
-        # Text encoder — Gemma3 (frozen)
+        # Text encoder — Gemma3 (frozen). LTX-2 uses Gemma-3-12B whose config is
+        # nested (text_config/vision_config); loading it with the v1
+        # GemmaForCausalLM class crashes in GenerationConfig.from_model_config
+        # ('dict' has no attribute 'to_dict'). Match diffusers' LTX2 pipeline,
+        # which uses Gemma3ForConditionalGeneration.
         text_encoder = (
-            GemmaForCausalLM.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
+            Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
+            .to(device)
+            .eval()
         )
         text_encoder.requires_grad_(False)
 

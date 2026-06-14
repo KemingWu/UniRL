@@ -10,11 +10,14 @@ rollout pipeline. Mode is determined by the request primitives:
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional, Tuple
+
+import torch
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts, Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
@@ -28,6 +31,14 @@ from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
+
+# LTX-2 3D-VAE geometry (fixed for the LTX-2 / LTX-2.3 family): 32x spatial,
+# 8x temporal compression, 128 latent channels. These constants are the single
+# source of truth for the driver-side ``latent_shape`` recipe AND the in-engine
+# unpack dims — they MUST match or the regenerated x_T won't round-trip.
+_LTX2_SPATIAL_COMPRESSION = 32
+_LTX2_TEMPORAL_COMPRESSION = 8
+_LTX2_LATENT_CHANNELS = 128
 
 
 class LTX2Pipeline(Pipeline):
@@ -49,6 +60,11 @@ class LTX2Pipeline(Pipeline):
         self.vae_decode = vae_decode
         self.vae_encode = vae_encode
         self.config = config
+        # Exposed for the hosting engine (TrainsideRolloutEngine reads
+        # ``pipeline.shift`` to build a FlowMatchSchedulePolicy at startup) —
+        # same convention as SD3/flux2klein. ``generate`` itself reads
+        # ``self.config.shift`` directly.
+        self.shift = config.shift
 
     @classmethod
     def from_config(
@@ -95,6 +111,80 @@ class LTX2Pipeline(Pipeline):
             config=config,
         )
 
+    @classmethod
+    def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for the
+        driver-side x_T recipe (``LatentShapeProvider`` contract).
+
+        LTX-2 3D-VAE: 32x spatial, 8x temporal, 128 latent channels. The
+        temporal axis is causal, so ``T_lat = (num_frames - 1) // 8 + 1``.
+        Noise is generated UNPACKED (5D) here; the pipeline packs it into the
+        transformer's ``(B, seq, C)`` token layout in ``generate``. Mirrors
+        diffusers' ``LTX2Pipeline.prepare_latents``.
+        """
+        height = int(sampling_spec.height)
+        width = int(sampling_spec.width)
+        num_frames = int(sampling_spec.num_frames)
+        if (num_frames - 1) % _LTX2_TEMPORAL_COMPRESSION != 0:
+            raise ValueError(
+                f"LTX2 VAE temporal_compression={_LTX2_TEMPORAL_COMPRESSION} requires "
+                f"(num_frames - 1) % {_LTX2_TEMPORAL_COMPRESSION} == 0, got num_frames={num_frames}; "
+                f"valid choices: 1, 9, 17, 25, 33, ..."
+            )
+        latent_t = (num_frames - 1) // _LTX2_TEMPORAL_COMPRESSION + 1
+        latent_h = height // _LTX2_SPATIAL_COMPRESSION
+        latent_w = width // _LTX2_SPATIAL_COMPRESSION
+        return (_LTX2_LATENT_CHANNELS, latent_t, latent_h, latent_w)
+
+    def _patch_sizes(self) -> Tuple[int, int]:
+        """``(patch_size, patch_size_t)`` read off the transformer config
+        (defaults 1/1 — LTX-2 patchifies in the proj_in linear, not by reshape).
+        """
+        cfg = self.bundle.transformer.config
+        return int(getattr(cfg, "patch_size", 1)), int(getattr(cfg, "patch_size_t", 1))
+
+    @staticmethod
+    def _pack_latents(latents: torch.Tensor, patch_size: int, patch_size_t: int) -> torch.Tensor:
+        """5D ``(B, C, F, H, W)`` → packed ``(B, seq, C·p_t·p·p)``.
+
+        Verbatim from diffusers ``LTX2Pipeline._pack_latents``.
+        """
+        batch_size, num_channels, num_frames, height, width = latents.shape
+        post_f = num_frames // patch_size_t
+        post_h = height // patch_size
+        post_w = width // patch_size
+        latents = latents.reshape(
+            batch_size, -1, post_f, patch_size_t, post_h, patch_size, post_w, patch_size
+        )
+        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        return latents
+
+    @staticmethod
+    def _unpack_latents(
+        latents: torch.Tensor, num_frames: int, height: int, width: int, patch_size: int, patch_size_t: int
+    ) -> torch.Tensor:
+        """Packed ``(B, seq, D)`` → 5D ``(B, C, F, H, W)`` — inverse of pack.
+
+        Verbatim from diffusers ``LTX2Pipeline._unpack_latents``.
+        """
+        batch_size = latents.size(0)
+        latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
+        latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        return latents
+
+    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Channel-wise denormalize a 5D latent by the VAE's ``latents_mean/std``
+        and ``scaling_factor`` before decode (diffusers ``_denormalize_latents``).
+
+        Inverse of the VAE's normalization. (Pure x_T noise is fed RAW to the
+        transformer — see ``generate`` — so there is no forward ``_normalize``
+        on the rollout path; only the produced latents are denormalized here.)
+        """
+        vae = self.bundle.vae
+        mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+        return latents * std / float(vae.config.scaling_factor) + mean
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run T2V / I2V / T2AV based on request primitives."""
         texts = req.primitives.get("text")
@@ -135,15 +225,28 @@ class LTX2Pipeline(Pipeline):
         if req.sigmas is not None:
             sigmas = req.sigmas.to(self.bundle.device)
 
-        # 4. Initial latents
-        # TODO: compute latent shape from config + params (height, width, num_frames)
-        # For now, expect initial_latents from the driver
-        initial_latents = req.request_conditions.get("initial_latents")
-        if initial_latents is None:
+        # 4. Initial latents — driver-authoritative x_T via the model-aware
+        # recipe (NoiseRecipe). The driver ships only a lightweight recipe
+        # (init_noise_group_ids + init_noise_latent_shape, the 5D shape from
+        # this pipeline's ``latent_shape``); we regenerate the byte-identical
+        # UNPACKED 5D noise here, then pack into the transformer's
+        # ``(B, seq, C)`` token layout. Pure x_T noise is NOT normalized —
+        # diffusers ``prepare_latents`` only normalizes PROVIDED img2img latents;
+        # the randn path packs raw N(0,1) noise (flow-matching x_T). Only the
+        # FINAL latents are denormalized before VAE decode (step 6).
+        # ``resolve()`` returns None only under DISABLE_DRIVER_XT — then the
+        # recipe shape is None too and we cannot draw video noise without a
+        # shape, so that path is unsupported here.
+        latents_5d = NoiseRecipe.from_rollout_req(req).resolve(device=self.bundle.device)
+        if latents_5d is None:
             raise ValueError(
-                "LTX2Pipeline.generate: initial_latents must be provided in "
-                "req.request_conditions['initial_latents'] (driver-authoritative noise)."
+                "LTX2Pipeline.generate: no initial latents. The driver x_T recipe "
+                "(init_noise_group_ids + init_noise_latent_shape) is required; "
+                "DISABLE_DRIVER_XT is not supported for LTX2 (video noise needs a "
+                "driver-resolved 5D latent shape)."
             )
+        patch_size, patch_size_t = self._patch_sizes()
+        initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
         # 5. Diffusion loop
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
@@ -155,8 +258,15 @@ class LTX2Pipeline(Pipeline):
             sde_indices=sde_indices,
         )
 
-        # 6. VAE decode → video frames
-        decoded_video = self.vae_decode.decode(segment.final_latents)
+        # 6. Unpack + denormalize → 5D latents → VAE decode → video frames
+        _, latent_t, latent_h, latent_w = self.latent_shape(
+            model_config=self.config, sampling_spec=params
+        )
+        unpacked = self._unpack_latents(
+            segment.final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t
+        )
+        unpacked = self._denormalize_latents(unpacked)
+        decoded_video = self.vae_decode.decode(unpacked)
         decoded = Videos(frames=decoded_video)
 
         # 7. Build response

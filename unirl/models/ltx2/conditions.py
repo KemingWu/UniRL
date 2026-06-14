@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ from unirl.distributed.tensor.batch import Batch, concat_field
 from unirl.types.conditions import TextEmbedCondition
 
 
+@dataclass
 class LTX2Conditions(Batch):
     """Conditions passed to the LTX2 diffusion stage.
 
