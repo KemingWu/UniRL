@@ -117,7 +117,7 @@ class HunyuanImage3TextEmbedStage:
         # leaves ``_tkwrapper`` as None until ``load_tokenizer`` is called.
         # ``_ensure_tokenizer_loaded`` backfills config.model_version first
         # (the ckpt's load_tokenizer reads it but the config never defines it).
-        _ensure_tokenizer_loaded(transformer, bundle.tokenizer)
+        _ensure_tokenizer_loaded(transformer, bundle.pretrained_path)
 
         out = transformer._tkwrapper.apply_chat_template(
             batch_prompt=prompts,

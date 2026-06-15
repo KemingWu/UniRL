@@ -308,7 +308,7 @@ class HunyuanImage3Bundle(Bundle):
         # after ``from_pretrained``. Do it here so callers (the smoke script
         # and ``from_config``) don't need to remember. ``_ensure_tokenizer_loaded``
         # backfills the missing ``config.model_version`` the ckpt code expects.
-        _ensure_tokenizer_loaded(transformer, self.tokenizer)
+        _ensure_tokenizer_loaded(transformer, self.pretrained_path)
 
         # Tokenize + splice in special markers (<boi>, <img>, <timestep>,
         # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
@@ -710,18 +710,24 @@ def _current_rank() -> int:
     return 0
 
 
-def _ensure_tokenizer_loaded(transformer: nn.Module, tokenizer: Any) -> None:
+def _ensure_tokenizer_loaded(transformer: nn.Module, tokenizer_path: str) -> None:
     """Populate ``transformer._tkwrapper`` via the checkpoint's
     ``load_tokenizer``, once.
 
-    The HunyuanImage-3.0-Instruct remote modeling code calls
-    ``HunyuanImage3TokenizerFast.from_pretrained(tokenizer,
-    model_version=self.config.model_version)``, but neither the shipped
-    ``HunyuanImage3Config`` class nor its ``config.json`` defines
-    ``model_version`` — so the attribute access raises ``AttributeError``.
-    The value is never used (the tokenizer drops it into ``**kwargs`` and
-    ignores it), so we backfill a harmless placeholder on the config before
-    the call. Idempotent: no-op once ``_tkwrapper`` is set.
+    The HunyuanImage-3.0-Instruct remote modeling code's ``load_tokenizer``
+    does ``HunyuanImage3TokenizerFast.from_pretrained(tokenizer, ...)`` — i.e.
+    it expects ``tokenizer`` to be a **path / repo-id string** (the official
+    usage is ``model.load_tokenizer(model_path)``), NOT an already-loaded
+    tokenizer object. Passing the object makes ``from_pretrained`` treat its
+    ``repr()`` as a path → ``OSError: Can't load tokenizer for
+    'PreTrainedTokenizerFast(...)'`` (with the full added-tokens dump). So we
+    pass the checkpoint path here.
+
+    It also reads ``self.config.model_version``, which neither the shipped
+    ``HunyuanImage3Config`` class nor its ``config.json`` defines — the value
+    is pass-through-only into the tokenizer's ignored ``**kwargs``, so we
+    backfill a harmless placeholder before the call. Idempotent: no-op once
+    ``_tkwrapper`` is set.
     """
     if getattr(transformer, "_tkwrapper", None) is not None:
         return
@@ -730,7 +736,7 @@ def _ensure_tokenizer_loaded(transformer: nn.Module, tokenizer: Any) -> None:
         # Pass-through-only kwarg in the checkpoint's tokenizer; value is
         # irrelevant, presence is all that's required.
         cfg.model_version = "3.0"
-    transformer.load_tokenizer(tokenizer)
+    transformer.load_tokenizer(tokenizer_path)
 
 
 def _resolve_local_ckpt_path(pretrained_path: str) -> str:
