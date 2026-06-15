@@ -32,6 +32,7 @@ from .config import (
     LTX2PipelineConfig,
 )
 from .diffusion import LTX2DiffusionStage
+from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
@@ -113,6 +114,17 @@ class LTX2Pipeline(Pipeline):
             vae_encode=vae_encode,
             config=config,
         )
+
+    def build_schedule_policy(self):
+        """Build the LTX-2 schedule policy (constant-μ exponential shift).
+
+        The hosting engine (``TrainsideRolloutEngine``) calls this at startup
+        to pin ``req.sigmas`` before ``generate``. LTX-2 uses dynamic-shifting
+        with μ ≡ ``max_shift`` (2.05) — NOT the static ``shift=1.0`` the engine
+        would otherwise fall back to (which under-resolves the trajectory and
+        yields blurry frames). See ``schedule.py`` for the diffusers alignment.
+        """
+        return build_ltx2_schedule_policy(self.shift)
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:

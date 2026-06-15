@@ -75,6 +75,7 @@ def get_sigma_schedule(
     *,
     mu: Optional[float] = None,
     time_shift_type: str = "exponential",
+    shift_terminal: Optional[float] = None,
 ) -> torch.Tensor:
     """Compute the FlowMatch σ schedule of length ``num_steps + 1``.
 
@@ -88,6 +89,10 @@ def get_sigma_schedule(
       ``linspace(1, 1/T)`` base grid every real FlowMatch pipeline uses
       (omitting ``sigmas=`` degenerates diffusers' small-σ tail to
       ``≈ 1/num_train_timesteps``). ``shift`` is unused.
+
+    ``shift_terminal`` (dynamic branch only): when set, the diffusers
+    scheduler stretches the σ grid so its final value equals this terminal
+    (``stretch_shift_to_terminal``). LTX-2 needs ``0.1``; ``None`` skips it.
     """
     if mu is None:
         # DELETE-WHEN: diffusers #13243 fixed → drop this branch and route
@@ -101,6 +106,7 @@ def get_sigma_schedule(
             num_train_timesteps=1000,
             use_dynamic_shifting=True,
             time_shift_type=time_shift_type,
+            shift_terminal=shift_terminal,
         )
         base_sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         scheduler.set_timesteps(num_inference_steps=num_steps, sigmas=base_sigmas, mu=mu)
@@ -230,6 +236,11 @@ class FlowMatchSchedulePolicy:
     time_shift_type: str = "exponential"
     vae_scale_factor: int = 8
     patch_size: int = 2
+    # Optional terminal-σ stretch (diffusers FlowMatchEulerDiscreteScheduler
+    # ``shift_terminal``). When set, the dynamic σ grid is stretched so its
+    # final value equals this terminal. LTX-2 ships ``shift_terminal=0.1``;
+    # most other models leave it ``None`` (no stretch). Dynamic branch only.
+    shift_terminal: Optional[float] = None
 
     def compute_mu(self, image_seq_len: int, num_inference_steps: int) -> float:
         """Dynamic-shift μ for this policy — the single per-model override point.
@@ -281,6 +292,7 @@ class FlowMatchSchedulePolicy:
             device,
             mu=mu,
             time_shift_type=self.time_shift_type,
+            shift_terminal=self.shift_terminal,
         )
 
     @classmethod
