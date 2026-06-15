@@ -136,8 +136,8 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/pickscore/train.txt
-      eval_data_path: datasets/pickscore/test.txt
+      data_path: datasets/vid_prompt/train.txt
+      eval_data_path: datasets/vid_prompt/test.txt
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}
