@@ -206,7 +206,7 @@ class HunyuanImage3Bundle(Bundle):
         height: int,
         width: int,
         bot_task: str = "image",
-        batch_cond_image_info: Optional[List[List[Any]]] = None,
+        batch_cond_images: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Build the upstream MM input tensors for a t2i diffusion step.
 
@@ -313,13 +313,16 @@ class HunyuanImage3Bundle(Bundle):
         # Tokenize + splice in special markers (<boi>, <img>, <timestep>,
         # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
         # cfg_factor=2, the wrapper internally duplicates the prompt slot
-        # for the unconditional branch.
-        out = transformer._tkwrapper.apply_chat_template(
+        # for the unconditional branch. ``apply_chat_template`` lives on the
+        # loaded tokenizer (``transformer.tokenizer``); the ckpt has no
+        # ``_tkwrapper`` attribute. The cond-image kwarg is ``batch_cond_images``
+        # (list[CondImage] per sample), built by the caller for it2i.
+        out = transformer.tokenizer.apply_chat_template(
             batch_prompt=list(prompts),
             batch_message_list=None,
             mode="gen_image",
             batch_gen_image_info=batch_gen_image_info,
-            batch_cond_image_info=batch_cond_image_info,
+            batch_cond_images=batch_cond_images,
             batch_system_prompt=None,
             batch_cot_text=None,
             max_length=None,
@@ -387,7 +390,7 @@ class HunyuanImage3Bundle(Bundle):
         # gen_timestep_scatter_index: [N, K] long (K is small, index of <timestep> tokens)
         gen_timestep_scatter_index: torch.Tensor = output.gen_timestep_scatter_index.to(device)
 
-        # When ``batch_cond_image_info`` was passed, the wrapper emits
+        # When ``batch_cond_images`` was passed, the wrapper emits
         # cond-image position pin-points (cond_vae_image_mask /
         # cond_vit_image_mask) and the cond-timestep scatter index.
         # ``None`` for vanilla t2i.
@@ -711,7 +714,7 @@ def _current_rank() -> int:
 
 
 def _ensure_tokenizer_loaded(transformer: nn.Module, tokenizer_path: str) -> None:
-    """Populate ``transformer._tkwrapper`` via the checkpoint's
+    """Populate ``transformer._tokenizer`` via the checkpoint's
     ``load_tokenizer``, once.
 
     The HunyuanImage-3.0-Instruct remote modeling code's ``load_tokenizer``
@@ -727,9 +730,13 @@ def _ensure_tokenizer_loaded(transformer: nn.Module, tokenizer_path: str) -> Non
     ``HunyuanImage3Config`` class nor its ``config.json`` defines — the value
     is pass-through-only into the tokenizer's ignored ``**kwargs``, so we
     backfill a harmless placeholder before the call. Idempotent: no-op once
-    ``_tkwrapper`` is set.
+    The checkpoint's ``load_tokenizer`` sets ``self._tokenizer`` (exposed via
+    the ``.tokenizer`` property) — there is NO ``_tkwrapper`` attribute (that
+    was an older upstream name). ``apply_chat_template`` lives on the loaded
+    ``HunyuanImage3TokenizerFast`` (i.e. ``transformer.tokenizer``). Idempotent:
+    no-op once ``_tokenizer`` is set.
     """
-    if getattr(transformer, "_tkwrapper", None) is not None:
+    if getattr(transformer, "_tokenizer", None) is not None:
         return
     cfg = getattr(transformer, "config", None)
     if cfg is not None and not hasattr(cfg, "model_version"):

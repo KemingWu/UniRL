@@ -113,18 +113,19 @@ class HunyuanImage3TextEmbedStage:
             len(prompts) if prompts is not None else len(batch_message_list)  # type: ignore[arg-type]
         )
 
-        # Ensure the tokenizer wrapper is loaded -- AutoModelForCausalLM
-        # leaves ``_tkwrapper`` as None until ``load_tokenizer`` is called.
-        # ``_ensure_tokenizer_loaded`` backfills config.model_version first
-        # (the ckpt's load_tokenizer reads it but the config never defines it).
+        # Ensure the tokenizer is loaded -- AutoModelForCausalLM leaves
+        # ``_tokenizer`` as None until ``load_tokenizer`` is called.
+        # ``_ensure_tokenizer_loaded`` also backfills config.model_version.
+        # ``apply_chat_template`` lives on ``transformer.tokenizer`` (the ckpt
+        # has no ``_tkwrapper`` attribute).
         _ensure_tokenizer_loaded(transformer, bundle.pretrained_path)
 
-        out = transformer._tkwrapper.apply_chat_template(
+        out = transformer.tokenizer.apply_chat_template(
             batch_prompt=prompts,
             batch_message_list=batch_message_list,
             mode="gen_text",
             batch_gen_image_info=None,
-            batch_cond_image_info=batch_cond_image_info,
+            batch_cond_images=batch_cond_image_info,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,
             max_length=max_length,

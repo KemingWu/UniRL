@@ -78,8 +78,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #       "attention_mask"}}
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # Chat template path: pass batch_cond_image_info so the wrapper
-    # splices in <img> markers; the resulting ``cond_vit_image_mask``
+    # Chat template path: pass cond images (CondImage objects) so the
+    # wrapper splices in <img> markers; the resulting ``cond_vit_image_mask``
     # (now on ``fused``) pins which ``input_ids`` positions hold the
     # ViT scatter target.
     mm = pipeline.text_embed.embed_for_ar(
@@ -87,7 +87,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         bot_task=bot_task,
         system_prompt=system_prompt_list,
         cot_text=([ar_params.cot_text] * len(texts.texts) if ar_params.cot_text else None),
-        batch_cond_image_info=vit["joint_image_info"],
+        batch_cond_image_info=vit["cond_images"],
     )
 
     cond_vit = ImageEmbedCondition(

@@ -99,7 +99,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         height=int(params.height),
         width=int(params.width),
         bot_task=bot_task,
-        batch_cond_image_info=vit["joint_image_info"],
+        batch_cond_images=vit["cond_images"],
     )
 
     # 5. Pack into the typed conditions container. The chat-template

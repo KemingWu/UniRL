@@ -128,15 +128,36 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
         # convention the unified-MM forward iterates with at
         # ``hunyuan.py:1903-1904``.
         joint_image_info: List[List[Any]] = []
+        cond_images: List[Any] = []
         cond_vit_images: List[torch.Tensor] = []
         spatial_shapes_list: List[torch.Tensor] = []
         attn_mask_list: List[torch.Tensor] = []
+        # ``CondImage`` lives in the checkpoint's tokenization module (the same
+        # module the loaded tokenizer class comes from). apply_chat_template's
+        # ``batch_cond_images`` wants CondImage objects (it reads .section_type
+        # and .i), NOT raw JointImageInfo — wrap each preprocess result.
+        from importlib import import_module
+
+        tok_module = import_module(type(transformer.tokenizer).__module__)
+        CondImage = getattr(tok_module, "CondImage")
         for b in range(int(pixels.shape[0])):
             pil_image = to_pil_image(pixels[b].clamp(0.0, 1.0).float().cpu())
             if pil_image.mode != "RGB":
                 pil_image = pil_image.convert("RGB")
             info = image_processor.preprocess(pil_image)
             joint_image_info.append([info])
+
+            # Wrap as a joint (VAE + ViT) cond image. CondImage("vae_vit", ...)
+            # builds self.i = JointImageInfo(vae_image.i, vit_image.i) and sets
+            # section_type="cond_joint_image" — what apply_chat_template needs.
+            # The vae/vit ImageTensors carry their ImageInfo on ``.i``.
+            vae_img = info.vae_image_info.image_tensor
+            vit_img = info.vision_image_info.image_tensor
+            if getattr(vae_img, "i", None) is None:
+                vae_img.i = info.vae_image_info
+            if getattr(vit_img, "i", None) is None:
+                vit_img.i = info.vision_image_info
+            cond_images.append(CondImage(image_type="vae_vit", vae_image=vae_img, vit_image=vit_img))
 
             # vision_image_info.image_tensor: [1, S, D] -- keep the leading
             # 1-dim so the per-sample tensor is [n_cond=1, S, D].
@@ -150,6 +171,7 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
 
         return {
             "joint_image_info": joint_image_info,
+            "cond_images": cond_images,
             "cond_vit_images": cond_vit_images,
             "vit_kwargs": {
                 "spatial_shapes": spatial_shapes_list,

@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.train.stack import TrainStepResult
@@ -49,10 +49,18 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         enable_fsdp_offload: bool = False,
         adv_use_global_std: bool = False,
+        stage_params: Optional[DictConfig] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
+        # Model-specific routing metadata (e.g. HunyuanImage3 ``task: it2i``)
+        # threaded onto every RolloutReq.stage_config so the pipeline dispatches
+        # to the right mode. Plain dict so it survives the Ray hop. Empty when
+        # the recipe has no ``stage_params:`` block (pure-T2I models ignore it).
+        self._stage_config: dict = (
+            dict(OmegaConf.to_container(stage_params, resolve=True)) if stage_params is not None else {}
+        )
         # Colocate memory dance: offload the FSDP train state (params + grads +
         # optimizer) to CPU during the rollout's generate so a colocate
         # vLLM/SGLang engine fits, onload before the train backward. Off by
@@ -295,6 +303,7 @@ class DiffusionTrainer(BaseTrainer):
             metadata=list(inputs.metadata) if inputs.metadata else [],
             init_noise_group_ids=init_noise_group_ids,
             init_noise_latent_shape=init_noise_latent_shape,
+            stage_config=dict(self._stage_config),
         )
 
     def train_step(
