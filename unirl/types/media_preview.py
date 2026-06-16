@@ -127,6 +127,26 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     return total
 
 
+def _hconcat_pil(left: Any, right: Any) -> Any:
+    """Concatenate two PIL images side by side ("input | output").
+
+    Resizes ``right`` to ``left``'s height (preserving aspect) so edit pairs of
+    differing resolution still align. Returns ``right`` alone if PIL is somehow
+    unavailable — media logging must never crash training.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return right
+    if right.height != left.height:
+        new_w = max(1, int(round(right.width * left.height / right.height)))
+        right = right.resize((new_w, left.height))
+    canvas = Image.new("RGB", (left.width + right.width, left.height))
+    canvas.paste(left.convert("RGB"), (0, 0))
+    canvas.paste(right.convert("RGB"), (left.width, 0))
+    return canvas
+
+
 def build_media_preview_for_track(
     *,
     req: "RolloutReq",
@@ -196,11 +216,24 @@ def build_media_preview_for_track(
         pixels = decoded.pixels
         if pixels is None:
             return None
+        # For image-edit tasks (it2i) the request carries an input condition
+        # image per sample (``req.primitives["image"]``), expanded 1:1 with the
+        # output samples by ``RolloutInputs.expand``. When present, build a
+        # side-by-side "input | output" PIL so wandb shows the actual edit, not
+        # just the output. Falls back to output-only (t2i, or no input image).
+        input_pixels = None
+        image_prim = req.primitives.get("image")
+        if isinstance(image_prim, Images) and image_prim.pixels is not None:
+            input_pixels = image_prim.pixels
         for idx in range(int(pixels.shape[0])):
             if len(selected_indices) >= limit:
                 break
-            img = pixels[idx]
-            images.append(tensor_frame_to_pil(img[:3]))
+            out_pil = tensor_frame_to_pil(pixels[idx][:3])
+            if input_pixels is not None and idx < int(input_pixels.shape[0]):
+                in_pil = tensor_frame_to_pil(input_pixels[idx][:3])
+                images.append(_hconcat_pil(in_pil, out_pil))
+            else:
+                images.append(out_pil)
             selected_indices.append(idx)
     else:
         per_sample = decoded.to_list()
