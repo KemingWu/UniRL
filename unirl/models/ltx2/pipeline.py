@@ -18,7 +18,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Audio, Audios, Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import get_diffusion_params
@@ -31,10 +31,10 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage
+from .diffusion import _LTX2_FRAME_RATE, LTX2DiffusionStage, _audio_num_frames
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
-from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
+from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +57,14 @@ class LTX2Pipeline(Pipeline):
         vae_decode: LTX2VAEDecodeStage,
         vae_encode: Optional[LTX2VAEEncodeStage],
         config: LTX2PipelineConfig,
+        audio_decode: Optional[LTX2AudioDecodeStage] = None,
     ) -> None:
         self.bundle = bundle
         self.text_embed = text_embed
         self.diffusion = diffusion
         self.vae_decode = vae_decode
         self.vae_encode = vae_encode
+        self.audio_decode = audio_decode
         self.config = config
         # Exposed for the hosting engine (TrainsideRolloutEngine reads
         # ``pipeline.shift`` to build a FlowMatchSchedulePolicy at startup) —
@@ -105,6 +107,8 @@ class LTX2Pipeline(Pipeline):
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
+        # Audio decode only when the bundle loaded audio components (T2AV).
+        audio_decode = LTX2AudioDecodeStage(bundle) if bundle.has_audio else None
 
         return cls(
             bundle=bundle,
@@ -112,6 +116,7 @@ class LTX2Pipeline(Pipeline):
             diffusion=diffusion,
             vae_decode=vae_decode,
             vae_encode=vae_encode,
+            audio_decode=audio_decode,
             config=config,
         )
 
@@ -300,7 +305,30 @@ class LTX2Pipeline(Pipeline):
             decoded=decoded,
         )
 
-        return RolloutResp(tracks={"video": track})
+        tracks = {"video": track}
+
+        # 8. T2AV: decode the co-denoised audio latent → waveform and attach a
+        # sibling "audio" track. The audio trajectory rides ``aux_latents`` at
+        # the same sparse indices as the video latents; the clean final audio
+        # latent is the last step (T). The audio track mirrors the video track's
+        # sample_ids/parent_ids so the reward side can pair them per sample.
+        # ``has_audio=False`` (pure T2V) skips this entirely — behavior unchanged.
+        if self.audio_decode is not None and segment.aux_latents is not None:
+            final_audio_latent = segment.aux_latents_at(int(params.num_inference_steps))
+            num_audio_frames = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+            waveform = self.audio_decode.decode(final_audio_latent, num_audio_frames)
+            # waveform: (B, L) or (B, C, L) → per-sample Audio (waveform [L] or [C, L]).
+            audios = Audios.from_list([Audio(waveform=waveform[i]) for i in range(int(waveform.shape[0]))])
+            audio_track = RolloutTrack(
+                sample_ids=list(req.sample_ids),
+                parent_ids=list(req.group_ids),
+                conditions=conditions.to_dict(),
+                segment=None,  # audio is decoded here; no RL trajectory of its own
+                decoded=audios,
+            )
+            tracks["audio"] = audio_track
+
+        return RolloutResp(tracks=tracks)
 
 
 __all__ = ["LTX2Pipeline"]

@@ -11,6 +11,14 @@ from unirl.types.primitives import Video, Videos
 if TYPE_CHECKING:
     from .bundle import LTX2Bundle
 
+# LTX-2 audio-VAE geometry fallbacks (used when the audio_vae config does not
+# expose these). Match the diffusion stage's constants: 16 kHz vocoder output,
+# 64 mel bins, 4x mel compression. Kept local to avoid importing the diffusion
+# module's private names.
+_AUDIO_SAMPLING_RATE: int = 16000
+_AUDIO_MEL_BINS: int = 64
+_AUDIO_MEL_COMPRESSION: int = 4
+
 
 class LTX2VAEDecodeStage:
     """Decode latents → video frames via the LTX2 3D-VAE.
@@ -92,28 +100,86 @@ class LTX2VAEEncodeStage:
 
 
 class LTX2AudioDecodeStage:
-    """Decode audio latents → waveform via audio VAE + vocoder (LTX-2.3)."""
+    """Decode packed audio latents → waveform via audio VAE + vocoder (LTX-2).
+
+    Mirrors the diffusers ``LTX2Pipeline`` audio-decode path (and Flow-Factory's
+    reference ``decode``): ``denormalize → unpack → audio_vae.decode → vocoder``.
+    Note the order DIFFERS from video (video unpacks first, then denormalizes).
+    """
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         if bundle.audio_vae is None or bundle.vocoder is None:
-            raise RuntimeError("LTX2AudioDecodeStage requires audio_vae and vocoder (LTX-2.3 checkpoint).")
+            raise RuntimeError("LTX2AudioDecodeStage requires audio_vae and vocoder (LTX-2 audio checkpoint).")
         self.audio_vae = bundle.audio_vae
         self.vocoder = bundle.vocoder
         self.dtype = bundle.dtype
+        # Mel-bin geometry: prefer the audio_vae config, fall back to the LTX-2
+        # defaults shared with the diffusion stage (64 mel bins, 4x compression).
+        self._num_mel_bins = int(getattr(self.audio_vae.config, "mel_bins", _AUDIO_MEL_BINS))
+        self._mel_compression = int(getattr(self.audio_vae.config, "mel_compression_ratio", _AUDIO_MEL_COMPRESSION))
+
+    @property
+    def sampling_rate(self) -> int:
+        """Vocoder output sample rate (Hz). Reward backends need this to resample."""
+        for obj in (self.vocoder, self.audio_vae):
+            sr = getattr(getattr(obj, "config", None), "sampling_rate", None)
+            if sr is not None:
+                return int(sr)
+        return _AUDIO_SAMPLING_RATE
+
+    @staticmethod
+    def _unpack_audio_latents(latents: torch.Tensor, num_frames: int, num_mel_bins: int) -> torch.Tensor:
+        """Packed ``(B, seq, C·mel)`` → ``(B, C, T, mel)`` — inverse of the audio
+        pack. ``seq == num_frames`` and the feature dim splits into
+        ``(channels, mel_bins)``; mirrors diffusers ``_unpack_audio_latents``.
+        """
+        batch_size, seq_len, feat = latents.shape
+        channels = feat // num_mel_bins
+        latents = latents.reshape(batch_size, seq_len, channels, num_mel_bins)
+        # (B, T, C, mel) → (B, C, T, mel)
+        return latents.permute(0, 2, 1, 3).contiguous()
+
+    def _denormalize_audio_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Channel-wise denormalize packed audio latents by the audio VAE's
+        ``latents_mean/std`` (diffusers ``_denormalize_audio_latents``). No-op
+        if the VAE exposes no normalization stats.
+        """
+        vae = self.audio_vae
+        mean = getattr(vae, "latents_mean", None)
+        std = getattr(vae, "latents_std", None)
+        if mean is None or std is None:
+            return latents
+        # Packed latents are (B, seq, C·mel); stats are per audio channel, so
+        # broadcast over the feature dim is handled by the unpacked decode below.
+        mean = mean.flatten().to(latents.device, latents.dtype)
+        std = std.flatten().to(latents.device, latents.dtype)
+        scaling = float(getattr(vae.config, "scaling_factor", 1.0))
+        # Stats length matches the feature dim when packed; tile if per-channel.
+        if mean.numel() == latents.shape[-1]:
+            return latents * std / scaling + mean
+        return latents
 
     @torch.no_grad()
-    def decode(self, audio_latents: torch.Tensor) -> torch.Tensor:
-        """Decode audio latents → waveform.
+    def decode(self, audio_latents: torch.Tensor, num_audio_frames: int) -> torch.Tensor:
+        """Decode packed audio latents → waveform.
 
         Args:
-            audio_latents: Audio latent tensor from the diffusion stage.
+            audio_latents: Packed audio latents ``(B, seq, C·mel)`` from the
+                diffusion stage (same packed layout fed to the transformer).
+            num_audio_frames: Number of audio LATENT frames (``seq`` length),
+                from :func:`unirl.models.ltx2.diffusion._audio_num_frames`.
 
         Returns:
-            Audio waveform tensor.
+            Waveform tensor ``(B, L)`` (or ``(B, C, L)``) at :attr:`sampling_rate`.
         """
-        # Audio VAE decode → mel spectrogram
-        mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype)).sample
-        # Vocoder → waveform
+        latent_mel_bins = max(1, self._num_mel_bins // self._mel_compression)
+        # 1. Denormalize FIRST, then unpack (order differs from video!).
+        aud = self._denormalize_audio_latents(audio_latents)
+        # 2. Unpack: (B, seq, C·mel) → (B, C, T, mel).
+        aud = self._unpack_audio_latents(aud, num_audio_frames, latent_mel_bins)
+        # 3. Audio VAE decode → mel spectrogram.
+        mel = self.audio_vae.decode(aud.to(self.audio_vae.dtype), return_dict=False)[0]
+        # 4. Vocoder → waveform.
         waveform = self.vocoder(mel)
         return waveform
 
