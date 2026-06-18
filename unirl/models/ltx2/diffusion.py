@@ -415,13 +415,20 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
             for step_idx in target:
                 sigma = sigmas[step_idx].to(dtype=torch.float32)
                 sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx).to(device=device, dtype=self.autocast_dtype)
-                prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.autocast_dtype)
+                # Feed the model/strategy the SAME dtype generate() used
+                # (trajectory_dtype, the dtype the rollout latents were actually
+                # stored in). Upcasting to autocast_dtype here would make the
+                # replay model input differ from rollout (fp16 vs bf16 residual
+                # stream) → step-0 importance ratio != 1 and a biased FlowGRPO
+                # gradient. Matches WAN21 (which never re-casts at the replay
+                # call site). autocast still runs the matmuls in autocast_dtype.
+                sample = segment.latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
+                prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
                 # Reuse the audio state stored at this step from the rollout, so
                 # the video prediction matches what generate() produced (the
                 # video forward cross-attends to audio). Only the video pred is
                 # used for the log-prob; we discard the audio pred.
-                audio_sample = segment.aux_latents_at(step_idx).to(device=device, dtype=self.autocast_dtype)
+                audio_sample = segment.aux_latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
 
                 video_pred, _ = self.step_kernel.predict_noise(
                     self.bundle,

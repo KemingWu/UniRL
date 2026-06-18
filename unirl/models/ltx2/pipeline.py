@@ -214,6 +214,18 @@ class LTX2Pipeline(Pipeline):
 
         # Determine mode
         has_image = isinstance(images, Images)
+        if has_image:
+            # I2V is NOT wired end-to-end yet: the encode step below sets
+            # conditions.image_latent, but LTX2DiffusionStep.predict_noise never
+            # consumes it, so the image condition would be silently dropped
+            # (I2V degrades to T2V with no error). Fail loudly until the
+            # transformer image-conditioning path is implemented.
+            raise NotImplementedError(
+                "LTX2Pipeline: I2V (req.primitives['image']) is not supported yet — "
+                "the diffusion stage does not consume conditions.image_latent. "
+                "Only T2V is wired. Drop the image primitive, or implement the "
+                "image-conditioning path in LTX2DiffusionStep.predict_noise."
+            )
 
         # 1. Text embedding. CFG empty-negative: LTX-2's diffusers pipeline
         # defaults negative_prompt to "" when guidance is on, so the model sees
