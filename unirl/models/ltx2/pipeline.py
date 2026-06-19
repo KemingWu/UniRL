@@ -21,7 +21,6 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_diffusion_params
 
 from .bundle import LTX2Bundle
 from .conditions import LTX2Conditions
@@ -208,7 +207,11 @@ class LTX2Pipeline(Pipeline):
             )
 
         images = req.primitives.get("image")
-        params = get_diffusion_params(req.sampling_params)
+        # ``req.sampling_params`` is the per-stage dict keyed by stage name —
+        # same accessor every sibling pipeline uses (sd3/wan21/…). (The earlier
+        # ``get_diffusion_params`` helper only exists on the in-flight
+        # ComposedSamplingParams branch, not on main, so it broke import here.)
+        params = req.sampling_params.get("diffusion")
         if params is None:
             raise ValueError("LTX2Pipeline.generate: DiffusionSamplingParams required.")
 
