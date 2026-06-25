@@ -150,11 +150,12 @@ class LTX2AudioDecodeStage:
         )
         # 2. Unpack: [B, L, C*M] -> [B, C, L, M]
         aud = self._unpack_audio_latents(aud, audio_latent_length, num_mel_bins=latent_mel_bins)
-        # 3. Audio VAE decode -> mel spectrogram
-        aud = aud.to(self.audio_vae.dtype)
-        mel = self.audio_vae.decode(aud, return_dict=False)[0]
-        # 4. Vocoder -> waveform
-        waveform = self.vocoder(mel)
+        # 3. Audio VAE decode -> mel spectrogram (fp32: BigVGAN vocoder uses
+        #    snake activation + Kaiser sinc filters that overflow in bf16).
+        aud = aud.to(torch.float32)
+        mel = self.audio_vae.to(torch.float32).decode(aud, return_dict=False)[0]
+        # 4. Vocoder -> waveform (fp32 for numerical stability)
+        waveform = self.vocoder.to(torch.float32)(mel)
         return waveform
 
 

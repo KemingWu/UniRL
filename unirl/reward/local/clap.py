@@ -68,6 +68,8 @@ class CLAPRewardScorer(LocalRewardBackend):
         processed: List[np.ndarray] = []
         for waveform in audio_list:
             wf = waveform.detach().float()
+            if wf.isnan().any() or wf.isinf().any():
+                wf = torch.zeros_like(wf)
             if wf.ndim == 2:
                 # Reduce the channel axis to mono regardless of [C, L] vs [L, C]:
                 # the channel axis is the smaller of the two.
