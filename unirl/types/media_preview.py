@@ -240,6 +240,9 @@ def build_media_preview_for_track(
     audio_sr: Optional[int] = None
     decoded_audio = getattr(track, "decoded_audio", None)
     if decoded_audio is not None and hasattr(decoded_audio, "to_list"):
+        from unirl.distributed.tensor import hydrate, map_tree
+
+        decoded_audio = map_tree(decoded_audio, hydrate)
         audio_list = decoded_audio.to_list()
         for idx in selected_indices:
             if idx < len(audio_list):
