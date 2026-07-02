@@ -154,6 +154,15 @@ def compute_rollout_resp_metrics(*, resp: Any, trunc_len: Optional[int] = None) 
                 safe_name = str(cname).replace("/", "_")
                 cat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
                 metrics.update(_tensor_stats(f"{prefix}reward_{safe_name}", cat))
+        else:
+            import logging as _log
+
+            _log.getLogger(__name__).warning(
+                "compute_rollout_resp_metrics: track.component_rewards is %s (type=%s), "
+                "no per-component metrics will be logged.",
+                component_rewards,
+                type(component_rewards).__name__,
+            )
 
     return metrics
 

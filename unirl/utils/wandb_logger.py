@@ -677,8 +677,10 @@ class UniRLWandBLogger:
                     # Mux audio into mp4 when available (T2AV); otherwise plain array.
                     audio_wf = audios[idx] if idx < len(audios) else None
                     if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
-                        path = _write_video_with_audio(arr, int(video_fps), audio_wf, int(audio_sr))
-                        wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), fps=int(video_fps)))
+                        # PyAV expects (T, H, W, C) RGB24 frames; arr is (T, C, H, W).
+                        arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
+                        path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                        wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
                     else:
                         wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
                 if wandb_videos:

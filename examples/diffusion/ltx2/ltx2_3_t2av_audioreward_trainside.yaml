@@ -37,7 +37,7 @@ logging:
   # How often (in ROLLOUTS) to log generated media to wandb. One rollout =
   # one sampling batch (batch_size prompts x samples_per_prompt), NOT one
   # optimizer step. Set high to keep media logging sparse / cheap.
-  media_log_interval: 500
+  media_log_interval: 200
 
 bundle:
   _target_: unirl.models.ltx2.bundle.LTX2Bundle.from_config
