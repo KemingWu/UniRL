@@ -1,112 +1,163 @@
-"""Episodic rollout collection engine for embodied RL."""
+"""Embodied rollout engine — Remote that returns RolloutResp.
+
+This is the embodied-RL counterpart of ``TrainsideRolloutEngine``. It runs
+multi-step episodic interaction (env ↔ policy) and packages the result as
+a standard ``RolloutResp`` with ``RolloutTrack`` + ``EmbodiedSegment``.
+
+This makes it pluggable into the same ``train_step`` pattern as diffusion:
+    resp = self.rollout.generate(...)
+    track.compute_advantages()
+    stack.train_track(track)
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from omegaconf import DictConfig
 
+from unirl.distributed.group.remote import Remote, distributed
 from unirl.embodied.envs.base import BaseEmbodiedEnv
 from unirl.embodied.models.base import BasePolicy
-from unirl.embodied.types import EnvOutput, RolloutStepResult, Trajectory
+from unirl.embodied.types import EmbodiedSegment
+from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 
 logger = logging.getLogger(__name__)
 
 
-class EmbodiedRolloutEngine:
-    """Multi-step episodic rollout collection.
+class EmbodiedRolloutEngine(Remote):
+    """Multi-step episodic rollout that returns RolloutResp.
 
-    Runs the policy-environment interaction loop:
-        obs → model.predict → env.chunk_step → store → repeat
-
-    Supports grouping: multiple rollouts from the same initial state
-    for GRPO-style group-relative advantages.
+    Conforms to the same ``generate()`` → ``RolloutResp`` contract as other
+    UniRL rollout engines (trainside, sglang, vllm). TrainStack consumes
+    the returned track without knowing it came from episodic interaction.
     """
 
     def __init__(
         self,
-        env: BaseEmbodiedEnv,
-        model: BasePolicy,
-        cfg: DictConfig,
+        *,
+        env_cfg: DictConfig,
+        policy: BasePolicy,
+        max_episode_steps: int = 256,
+        group_size: int = 4,
+        num_groups: int = 8,
+        dataset_size: int = 1000,
     ):
-        self.env = env
-        self.model = model
-        self.n_chunk_steps = int(cfg.get("max_episode_steps", 256)) // env.chunk_size
-        self.group_size = int(cfg.get("group_size", 1))
+        super().__init__()
+        self._env_cfg = env_cfg
+        self._policy = policy
+        self._max_episode_steps = max_episode_steps
+        self._group_size = group_size
+        self._num_groups = num_groups
+        self._dataset_size = dataset_size
+        self._env: Optional[BaseEmbodiedEnv] = None
 
-    @torch.no_grad()
-    def collect_trajectory(
-        self,
-        episode_indices: torch.Tensor,
-        seed: Optional[int] = None,
-    ) -> Trajectory:
-        """Collect full episodes and return a Trajectory for training.
+    def _ensure_env(self):
+        if self._env is None:
+            from hydra.utils import instantiate
 
-        Args:
-            episode_indices: [num_groups] indices into the episode dataset.
-                Each index is repeated group_size times for grouped rollouts.
-            seed: optional RNG seed for environment reset.
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._env = instantiate(self._env_cfg, device=device)
 
-        Returns:
-            Trajectory with shape [T, B, ...] where B = num_groups * group_size.
-        """
-        # Expand indices for group rollouts
-        if self.group_size > 1:
-            expanded = episode_indices.repeat_interleave(self.group_size)
-        else:
-            expanded = episode_indices
+    @distributed()
+    def generate(self, *, rollout_id: int = 0) -> RolloutResp:
+        """Collect episodes and return a standard RolloutResp."""
+        self._ensure_env()
+        env = self._env
+        policy = self._policy
+        device = env.device
 
-        B = expanded.shape[0]
-        device = self.env.device
+        # Sample initial states (repeated for group_size siblings)
+        episode_indices = torch.randint(0, self._dataset_size, (self._num_groups,))
+        if self._group_size > 1:
+            episode_indices = episode_indices.repeat_interleave(self._group_size)
+        B = episode_indices.shape[0]
 
-        obs, _ = self.env.reset(episode_indices=expanded, seed=seed)
+        n_chunk_steps = self._max_episode_steps // env.chunk_size
 
-        steps: List[tuple] = []
+        # Reset env
+        obs, _ = env.reset(episode_indices=episode_indices)
+
+        # Collect trajectory
+        all_actions = []
+        all_logprobs = []
+        all_rewards = []
+        all_dones = []
+        all_obs = [obs]
         active = torch.ones(B, dtype=torch.bool, device=device)
 
-        for step_idx in range(self.n_chunk_steps):
-            # Get actions from policy
-            rollout_result = self._policy_forward(obs, active)
+        for t in range(n_chunk_steps):
+            with torch.no_grad():
+                result = policy.predict_action_batch(**obs)
 
-            # Step environment
-            next_obs, rewards, terminations, truncations, infos = self.env.chunk_step(rollout_result.actions)
+            actions = result["actions"]  # [B, chunk, action_dim]
+            logprobs = result["logprobs"]  # [B, chunk, action_dim]
 
-            env_output = EnvOutput(
-                obs=next_obs,
-                rewards=rewards,
-                terminations=terminations,
-                truncations=truncations,
-                dones=terminations.any(dim=-1) | truncations.any(dim=-1),
-                infos=infos,
-            )
+            next_obs, rewards, terminations, truncations, infos = env.chunk_step(actions)
 
-            steps.append((rollout_result, env_output))
+            step_dones = terminations.any(dim=-1) | truncations.any(dim=-1)
 
-            # Update active mask
-            active = active & ~env_output.dones
+            all_actions.append(actions)
+            all_logprobs.append(logprobs)
+            all_rewards.append(rewards)
+            all_dones.append(step_dones)
+
+            active = active & ~step_dones
             if not active.any():
                 break
 
             obs = next_obs
+            all_obs.append(obs)
 
-        trajectory = Trajectory.from_steps(
-            steps=steps,
-            max_steps=self.n_chunk_steps,
-            num_envs=B,
-            chunk_size=self.env.chunk_size,
-            action_dim=self.env.action_dim,
-            device=device,
-        )
-        return trajectory
+        # Build tensors [T, B, ...]
+        T = len(all_actions)
+        actions_t = torch.stack(all_actions, dim=0)  # [T, B, chunk, action_dim]
+        logprobs_t = torch.stack(all_logprobs, dim=0)  # [T, B, chunk, action_dim]
+        rewards_t = torch.stack(all_rewards, dim=0)  # [T, B, chunk]
+        dones_t = torch.stack(all_dones, dim=0)  # [T, B]
 
-    def _policy_forward(self, obs: dict, active: torch.Tensor) -> RolloutStepResult:
-        """Run policy on active environments."""
-        result = self.model.predict_action_batch(**obs)
-        return RolloutStepResult(
-            actions=result["actions"],
-            logprobs=result["logprobs"],
-            values=result.get("values"),
-            forward_inputs=result.get("forward_inputs"),
+        # Loss mask: 1 for valid steps
+        loss_mask = torch.ones(T, B, device=device)
+        for t in range(1, T):
+            loss_mask[t] = loss_mask[t - 1] * (~dones_t[t - 1]).float()
+
+        # Episode-level rewards for advantage computation
+        episode_rewards = (rewards_t.sum(dim=-1) * loss_mask).sum(dim=0)  # [B]
+
+        # Build EmbodiedSegment
+        segment = EmbodiedSegment(
+            action_log_probs=logprobs_t,
+            actions=actions_t,
+            observations={"steps": all_obs},
+            loss_mask=loss_mask,
         )
+
+        # Build RolloutTrack (same structure as diffusion trainer produces)
+        sample_ids = [f"ep_{i}" for i in range(B)]
+        group_ids = [f"g_{i // self._group_size}" for i in range(B)]
+
+        track = RolloutTrack(
+            sample_ids=sample_ids,
+            parent_ids=group_ids,
+            parent_track=None,
+            conditions={},
+            segment=segment,
+            decoded=None,
+            media_preview=None,
+            rewards=episode_rewards,
+            advantages=None,
+        )
+
+        return RolloutResp(tracks={"embodied": track})
+
+    @distributed()
+    def wake_up(self) -> None:
+        """No-op; embodied env is always ready."""
+
+    @distributed()
+    def sleep(self) -> None:
+        """Optionally offload env models."""
+        if self._env is not None:
+            self._env.offload()
