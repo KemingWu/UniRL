@@ -1,0 +1,67 @@
+# Embodied RL: Wan World Model + OpenVLA-OFT + GRPO
+#
+# Prerequisites:
+#   - Action-conditioned Wan checkpoint (DiT + VAE)
+#   - Reward classifier (ResNet or TaskEmbedResnet)
+#   - OpenVLA-OFT pretrained checkpoint
+#   - Episode dataset (npy trajectories)
+
+device: cuda
+
+dataset_size: 1000  # number of episodes in dataset
+
+env:
+  _target_: unirl.embodied.envs.wan_world_model.WanWorldModelEnv
+  cfg:
+    model_path: ${oc.env:WAN_MODEL_PATH,/path/to/wan_dit}
+    vae_path: ${oc.env:WAN_VAE_PATH,/path/to/wan_vae}
+    initial_image_path: ${oc.env:EPISODE_DATASET_PATH,/path/to/libero_episodes}
+    task_suite_name: libero_spatial
+    reward_model:
+      type: TaskEmbedResnetRewModel
+      from_pretrained: ${oc.env:REWARD_MODEL_PATH,/path/to/reward_classifier}
+    chunk: 8
+    condition_frame_length: 5
+    num_frames: 13
+    num_inference_steps: 5
+    image_size: [256, 256]
+    action_dim: 7
+    max_episode_steps: 40  # 5 chunk steps
+    reward_coef: 5.0
+    success_reward_threshold: 0.9
+    enable_kir: true
+    retain_action: true
+    group_size: 4
+  num_envs: 8
+
+model:
+  _target_: unirl.embodied.models.openvla_oft.OpenVLAOFTPolicy
+  cfg:
+    model_path: ${oc.env:OPENVLA_PATH,/path/to/openvla_oft_checkpoint}
+    num_action_chunks: 8
+    action_dim: 7
+    use_value_head: false
+    precision: bf16
+
+algorithm:
+  _target_: unirl.embodied.algorithms.base.GRPOAlgorithm
+  group_size: 4
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  reward_aggregation: sum
+
+rollout:
+  max_episode_steps: 40
+  group_size: 4
+  num_groups: 8
+
+training:
+  num_rollouts: 500
+  micro_batch_size: 4
+  num_updates_per_rollout: 1
+  learning_rate: 3.0e-4
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+
+logging:
+  log_interval: 10
