@@ -7,6 +7,23 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from unirl.types.segments.base import Segment
+
+
+@dataclass
+class EmbodiedSegment(Segment):
+    """Segment subclass for embodied RL trajectories.
+
+    Holds action log-probs and observations needed for PPO replay.
+    Conforms to the Segment protocol expected by TrainStack/StageAlgorithm.
+    """
+
+    action_log_probs: Optional[Any] = None  # [T, B, chunk, action_dim] old log-probs (π_old)
+    actions: Optional[Any] = None  # [T, B, chunk, action_dim]
+    observations: Optional[Any] = None  # per-step obs dict for replay
+    loss_mask: Optional[Any] = None  # [T, B]
+    task_descriptions: Optional[List[str]] = None
+
 
 @dataclass
 class EnvOutput:

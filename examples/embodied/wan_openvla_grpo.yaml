@@ -1,4 +1,5 @@
 # Embodied RL: Wan World Model + OpenVLA-OFT + GRPO
+# Uses UniRL's FSDPBackend + TrainStack for distributed training.
 #
 # Prerequisites:
 #   - Action-conditioned Wan checkpoint (DiT + VAE)
@@ -6,10 +7,63 @@
 #   - OpenVLA-OFT pretrained checkpoint
 #   - Episode dataset (npy trajectories)
 
-device: cuda
+num_devices: 8
+batch_size: 8
+dataset_size: 1000
+layout: colocate
+transport_kind: colocate_store
 
-dataset_size: 1000  # number of episodes in dataset
+# --- VLA Model Bundle ---
+bundle:
+  _target_: unirl.embodied.models.openvla_oft.OpenVLAOFTPolicy
+  cfg:
+    model_path: ${oc.env:OPENVLA_PATH,/path/to/openvla_oft_checkpoint}
+    num_action_chunks: 8
+    action_dim: 7
+    use_value_head: false
+    precision: bf16
 
+# --- FSDP Training Backend ---
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["LlamaDecoderLayer"]
+  trainable_attr: _model
+  fsdp_cfg:
+    sharding_strategy: FULL_SHARD
+    mixed_precision: bf16
+  optimizer_cfg:
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    type: cosine
+    warmup_steps: 50
+    total_steps: 500
+  lora_cfg:
+    rank: 32
+    alpha: 64
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# --- Algorithm (StageAlgorithm-compatible) ---
+algorithm:
+  _target_: unirl.embodied.algorithms.stage_algorithm.EmbodiedGRPO
+  clip_range: 0.2
+  clip_range_high: 0.28
+  clip_schedule: constant
+  # For advantage computation:
+  adv_type: grpo
+  group_size: 4
+
+# --- TrainStack ---
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+# --- Environment ---
 env:
   _target_: unirl.embodied.envs.wan_world_model.WanWorldModelEnv
   cfg:
@@ -26,7 +80,7 @@ env:
     num_inference_steps: 5
     image_size: [256, 256]
     action_dim: 7
-    max_episode_steps: 40  # 5 chunk steps
+    max_episode_steps: 40
     reward_coef: 5.0
     success_reward_threshold: 0.9
     enable_kir: true
@@ -34,6 +88,7 @@ env:
     group_size: 4
   num_envs: 8
 
+# --- Rollout Engine ---
 model:
   _target_: unirl.embodied.models.openvla_oft.OpenVLAOFTPolicy
   cfg:
@@ -43,25 +98,23 @@ model:
     use_value_head: false
     precision: bf16
 
-algorithm:
-  _target_: unirl.embodied.algorithms.base.GRPOAlgorithm
-  group_size: 4
-  clip_ratio_low: 0.2
-  clip_ratio_high: 0.28
-  reward_aggregation: sum
-
 rollout:
   max_episode_steps: 40
   group_size: 4
   num_groups: 8
 
+# --- Weight Sync (for separate layout) ---
+sync: null  # colocate layout shares weights; set for separate layout:
+  # _target_: unirl.distributed.weight_sync.lora.local.LocalLoraWeightSync
+
+# --- Logging ---
+logging:
+  report_to_wandb: true
+  project_name: unirl-embodied
+  run_name: wan_openvla_grpo
+  log_interval: 10
+
+# --- Training ---
 training:
   num_rollouts: 500
-  micro_batch_size: 4
-  num_updates_per_rollout: 1
-  learning_rate: 3.0e-4
-  max_grad_norm: 1.0
-  weight_decay: 0.01
-
-logging:
-  log_interval: 10
+  weight_sync_interval: 1
