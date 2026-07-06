@@ -14,15 +14,17 @@ from unirl.types.segments.base import Segment
 class EmbodiedSegment(Segment):
     """Segment subclass for embodied RL trajectories.
 
-    Holds action log-probs and observations needed for PPO replay.
-    Conforms to the Segment protocol expected by TrainStack/StageAlgorithm.
+    Stores action log-probs (π_old anchor) and forward_inputs cache for replay.
+    The forward_inputs dict contains: input_ids, attention_mask, pixel_values,
+    action_tokens — everything needed to recompute logprobs under updated weights.
     """
 
-    action_log_probs: Optional[Any] = None  # [T, B, chunk, action_dim] old log-probs (π_old)
-    actions: Optional[Any] = None  # [T, B, chunk, action_dim]
-    observations: Optional[Any] = None  # per-step obs dict for replay
+    action_log_probs: Optional[Any] = None  # [T, B, response_len] old log-probs
+    actions: Optional[Any] = None
+    observations: Optional[Any] = None
     loss_mask: Optional[Any] = None  # [T, B]
     task_descriptions: Optional[List[str]] = None
+    forward_inputs: Optional[Dict[str, Any]] = None  # cached for PPO replay
 
 
 @dataclass

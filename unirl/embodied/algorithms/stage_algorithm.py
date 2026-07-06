@@ -1,8 +1,9 @@
 """EmbodiedGRPO — StageAlgorithm-compatible PPO for embodied RL.
 
-This module bridges the embodied RL data (EmbodiedSegment with action
-log-probs) into UniRL's StageAlgorithm interface so that TrainStack can
-drive training without modification.
+Uses the cached forward_inputs from rollout to replay the VLA forward pass
+with updated weights, computing new log-probs for the PPO ratio. This is
+identical in principle to how LLM RLHF works: the action_tokens stay fixed,
+but the probability distribution over them changes as the model updates.
 """
 
 from __future__ import annotations
@@ -17,14 +18,16 @@ from unirl.embodied.types import EmbodiedSegment
 
 
 class EmbodiedGRPO(StageAlgorithm):
-    """PPO clip loss on continuous VLA action log-probs.
+    """PPO clip loss on discretized VLA action token log-probs.
 
-    Conforms to UniRL's ``StageAlgorithm`` interface:
-    - ``prepare_segment()``: freezes ``action_log_probs`` as π_old anchor
-    - ``compute_loss_and_backward()``: replays VLA forward, computes PPO loss
+    The VLA predicts action_dim * num_chunks tokens per step. Each token is a
+    categorical choice from n_action_bins options. Log-probs are per-token,
+    and the PPO ratio is computed on the sum of log-probs across all action
+    tokens in a step (equivalent to the joint probability of the action chunk).
 
-    Unlike FlowGRPO (SDE per-step logp on latents), this operates on
-    per-timestep action log-probs across an embodied episode.
+    Training replay: uses cached forward_inputs (input_ids, attention_mask,
+    pixel_values, action_tokens) to run the VLA forward pass with current
+    weights and get new log-probs for the SAME action tokens.
     """
 
     supports_multi_update = True
@@ -37,11 +40,13 @@ class EmbodiedGRPO(StageAlgorithm):
         clip_range: float = 0.2,
         clip_range_high: Optional[float] = None,
         clip_schedule: str = "constant",
+        entropy_bonus: float = 0.0,
     ):
         self.policy = policy
         self.clip_range = clip_range
         self.clip_range_high = clip_range_high
         self.clip_schedule = clip_schedule
+        self.entropy_bonus = entropy_bonus
 
     def prepare_segment(
         self,
@@ -49,12 +54,7 @@ class EmbodiedGRPO(StageAlgorithm):
         conditions: Mapping[str, Any],
         segment: EmbodiedSegment,
     ) -> None:
-        """Freeze action_log_probs as the π_old anchor.
-
-        Called once before the multi-update loop. The rollout-time log-probs
-        become the frozen anchor for PPO ratio computation.
-        """
-        # action_log_probs already populated during rollout — just detach
+        """Freeze action_log_probs as π_old anchor."""
         if segment.action_log_probs is not None:
             segment.action_log_probs = segment.action_log_probs.detach()
 
@@ -67,97 +67,104 @@ class EmbodiedGRPO(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        """Replay VLA forward, compute PPO clip loss, call backward.
+        """Replay VLA with cached forward_inputs, compute PPO loss, backward.
 
-        Args:
-            conditions: unused for embodied (observations are in segment).
-            segment: EmbodiedSegment with action_log_probs (old), actions, observations.
-            advantages: [B] per-episode advantages.
-            training_progress: [0, 1] for schedule.
-            loss_scale: gradient accumulation factor.
+        The replay re-runs the model forward on the SAME inputs but with updated
+        weights. The action_tokens are fixed (we compute logprobs for the same
+        actions), producing new_logprobs. The PPO ratio = exp(new - old).
         """
-        old_logprobs = segment.action_log_probs  # [T, B, chunk, action_dim]
-        actions = segment.actions  # [T, B, chunk, action_dim]
-        obs = segment.observations  # dict with per-step observations
-        mask = segment.loss_mask  # [T, B]
+        old_logprobs = segment.action_log_probs  # [T, B, response_len]
+        loss_mask = segment.loss_mask  # [T, B]
+        forward_inputs = segment.forward_inputs
 
-        # Replay: teacher-forced forward to get new log-probs
-        new_logprobs = self._replay(obs, actions)
+        # Replay all valid steps through the policy
+        new_logprobs_flat, entropy_flat = self._replay(forward_inputs)
 
-        # Flatten time dimension for loss computation
-        T, B = old_logprobs.shape[:2]
-        old_flat = old_logprobs.reshape(T * B, -1)  # [T*B, chunk*action_dim]
-        new_flat = new_logprobs.reshape(T * B, -1)
+        # Reconstruct [T, B, response_len] from flat [N_valid, response_len]
+        T, B = loss_mask.shape
+        valid_mask = loss_mask.bool()
+        response_len = old_logprobs.shape[-1]
 
-        # Broadcast advantages: [B] → [T*B] (each timestep gets episode advantage)
-        adv_expanded = advantages.unsqueeze(0).expand(T, B).reshape(T * B)
+        new_logprobs = torch.zeros(T, B, response_len, device=old_logprobs.device)
+        idx = 0
+        for t in range(T):
+            for b in range(B):
+                if valid_mask[t, b]:
+                    new_logprobs[t, b] = new_logprobs_flat[idx]
+                    idx += 1
 
-        # Build per-element mask
-        if mask is not None:
-            mask_flat = mask.reshape(T * B)
-        else:
-            mask_flat = torch.ones(T * B, device=old_flat.device)
+        # Sum log-probs across action tokens per step → joint action probability
+        old_step_logp = old_logprobs.sum(dim=-1)  # [T, B]
+        new_step_logp = new_logprobs.sum(dim=-1)  # [T, B]
 
-        # Sum log-probs across action dims for per-step ratio
-        old_step_logp = old_flat.sum(dim=-1)  # [T*B]
-        new_step_logp = new_flat.sum(dim=-1)  # [T*B]
+        # Flatten valid steps for loss computation
+        valid = valid_mask.reshape(-1)  # [T*B]
+        old_flat = old_step_logp.reshape(-1)[valid]  # [N_valid]
+        new_flat = new_step_logp.reshape(-1)[valid]  # [N_valid]
+
+        # Expand advantages [B] → per-step [T, B] → valid only
+        adv_expanded = advantages.unsqueeze(0).expand(T, B).reshape(-1)[valid]
 
         # PPO clip loss
         clip_range = self._resolve_clip_range(training_progress)
         clip_high = self.clip_range_high if self.clip_range_high is not None else clip_range
 
         loss_per_elem, metrics_tensors = _grpo_clip_loss(
-            new_logp=new_step_logp,
-            old_logp=old_step_logp,
+            new_logp=new_flat,
+            old_logp=old_flat,
             advantages=adv_expanded,
             clip_range=clip_range,
             clip_range_high=clip_high,
         )
 
-        # Masked mean reduction
-        valid_count = mask_flat.sum().clamp(min=1)
-        loss = (loss_per_elem * mask_flat).sum() / valid_count
+        loss = loss_per_elem.mean()
+
+        # Entropy bonus
+        if self.entropy_bonus > 0 and entropy_flat is not None:
+            entropy_mean = entropy_flat.mean()
+            loss = loss - self.entropy_bonus * entropy_mean
 
         # Backward
-        scaled_loss = loss * loss_scale
-        scaled_loss.backward()
+        (loss * loss_scale).backward()
 
-        # Metrics
         metrics: Dict[str, Any] = {
             "embodied/policy_loss": float(loss),
             "embodied/ratio_mean": float(metrics_tensors["ratio_mean"]),
             "embodied/clip_fraction": float(metrics_tensors["clip_fraction"]),
             "embodied/approx_kl": float(metrics_tensors["approx_kl"]),
         }
+        if self.entropy_bonus > 0 and entropy_flat is not None:
+            metrics["embodied/entropy"] = float(entropy_flat.mean())
 
         return AlgorithmStepResult(
             loss=float(loss),
             metrics=metrics,
-            num_steps_or_tokens=int(valid_count),
+            num_steps_or_tokens=int(valid.sum()),
             has_backward=True,
         )
 
-    def _replay(self, observations: Any, actions: torch.Tensor) -> torch.Tensor:
-        """Teacher-forced replay through the VLA to get new log-probs."""
-        T, B = actions.shape[:2]
+    def _replay(self, forward_inputs: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Replay VLA forward with cached inputs to get new log-probs.
 
-        if observations is None or not observations:
-            return torch.zeros_like(actions)
+        Args:
+            forward_inputs: dict with input_ids, attention_mask, pixel_values,
+                action_tokens concatenated across valid timesteps. Shape [N_valid, ...].
 
-        # Replay each timestep through the policy
-        all_logprobs = []
-        obs_steps = observations.get("steps", []) if isinstance(observations, dict) else []
+        Returns:
+            (new_logprobs[N_valid, response_len], entropy[N_valid] or None)
+        """
+        # Filter out metadata keys
+        model_inputs = {k: v for k, v in forward_inputs.items() if not k.startswith("_")}
 
-        for t in range(T):
-            if t < len(obs_steps) and obs_steps[t] is not None:
-                step_obs = obs_steps[t]
-                step_actions = actions[t]  # [B, chunk, action_dim]
-                result = self.policy.default_forward(obs=step_obs, actions=step_actions)
-                all_logprobs.append(result["logprobs"])
-            else:
-                all_logprobs.append(torch.zeros_like(actions[t]))
+        result = self.policy.default_forward(
+            forward_inputs=model_inputs,
+            compute_entropy=(self.entropy_bonus > 0),
+        )
 
-        return torch.stack(all_logprobs, dim=0)  # [T, B, chunk, action_dim]
+        logprobs = result["logprobs"]  # [N_valid, response_len]
+        entropy = result.get("entropy")  # [N_valid] or None
+
+        return logprobs, entropy
 
     def _resolve_clip_range(self, progress: float) -> float:
         if self.clip_schedule == "linear_decay":
