@@ -630,6 +630,8 @@ class UniRLWandBLogger:
             else:
                 video_key = f"{key}/videos"
 
+        # Temp mp4 files written by the audio-mux path; unlinked after upload.
+        _muxed_paths: List[str] = []
         try:
             n = max(len(images) if has_images else 0, len(videos) if has_videos else 0)
 
@@ -680,6 +682,7 @@ class UniRLWandBLogger:
                         # PyAV expects (T, H, W, C) RGB24 frames; arr is (T, C, H, W).
                         arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
                         path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                        _muxed_paths.append(path)
                         wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
                     else:
                         wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
@@ -689,6 +692,15 @@ class UniRLWandBLogger:
             wandb.log(payload)
         except Exception as e:
             print(f"Warning: Failed to log generated media: {e}")
+        finally:
+            # wandb.Video copies the file into the run dir on construction, so the
+            # temp mp4s are safe to remove once logging is done. Avoids leaking a
+            # /tmp mp4 per muxed sample every media-log step.
+            for _p in _muxed_paths:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
 
     def log_eval(
         self,
