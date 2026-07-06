@@ -302,12 +302,6 @@ class RewardService(Remote):
             str(name): torch.tensor(list(values or []), dtype=torch.float32)
             for name, values in dict(reward_response.component_rewards or {}).items()
         }
-        if component_rewards:
-            logger.info(
-                "RewardService: component_rewards keys=%s sizes=%s",
-                list(component_rewards.keys()),
-                {k: v.shape for k, v in component_rewards.items()},
-            )
         track = _track_with_field(track, "rewards", rewards)
         return _track_with_field(track, "component_rewards", component_rewards)
 
