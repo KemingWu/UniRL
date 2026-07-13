@@ -117,13 +117,13 @@ algorithm:
   teacher_guidance_scale: 4.5
   teachers:
     - name: pickscore
-      lora_path: ${oc.env:TEACHER_PICKSCORE_PATH,quanhaol/Aes-Teacher}
+      lora_path: ${oc.env:TEACHER_PICKSCORE_PATH,quanhaol/DiffusionOPD/AesTeacher}
       guidance_scale: 4.5
     - name: ocr
-      lora_path: ${oc.env:TEACHER_OCR_PATH,quanhaol/OCR-Teacher}
+      lora_path: ${oc.env:TEACHER_OCR_PATH,quanhaol/DiffusionOPD/OCRTeacher}
       guidance_scale: 4.5
     - name: geneval
-      lora_path: ${oc.env:TEACHER_GENEVAL_PATH,quanhaol/GenEval-Teacher}
+      lora_path: ${oc.env:TEACHER_GENEVAL_PATH,quanhaol/DiffusionOPD/GenEvalTeacher}
       guidance_scale: 1.0
 
 stack:

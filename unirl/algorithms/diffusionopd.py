@@ -181,17 +181,31 @@ class DiffusionOPD(StageAlgorithm):
             from huggingface_hub import hf_hub_download
 
             # Resolve local or HF path.
+            # Supports: local dir, "org/repo" (flat), "org/repo/subfolder" (nested).
             if os.path.isdir(lora_path):
                 config_path = os.path.join(lora_path, "adapter_config.json")
                 weight_path = os.path.join(lora_path, "adapter_model.safetensors")
                 if not os.path.exists(weight_path):
                     weight_path = os.path.join(lora_path, "adapter_model.bin")
             else:
-                config_path = hf_hub_download(lora_path, "adapter_config.json")
+                # Parse "org/repo/subfolder" → repo_id="org/repo", subfolder="subfolder"
+                parts = lora_path.split("/")
+                if len(parts) > 2:
+                    repo_id = "/".join(parts[:2])
+                    subfolder = "/".join(parts[2:])
+                else:
+                    repo_id = lora_path
+                    subfolder = None
+
+                dl_kwargs = {"repo_id": repo_id}
+                if subfolder:
+                    dl_kwargs["subfolder"] = subfolder
+
+                config_path = hf_hub_download(filename="adapter_config.json", **dl_kwargs)
                 try:
-                    weight_path = hf_hub_download(lora_path, "adapter_model.safetensors")
+                    weight_path = hf_hub_download(filename="adapter_model.safetensors", **dl_kwargs)
                 except Exception:
-                    weight_path = hf_hub_download(lora_path, "adapter_model.bin")
+                    weight_path = hf_hub_download(filename="adapter_model.bin", **dl_kwargs)
 
             with open(config_path) as f:
                 adapter_cfg = json.load(f)
