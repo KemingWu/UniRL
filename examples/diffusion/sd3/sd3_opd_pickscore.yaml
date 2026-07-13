@@ -17,7 +17,7 @@
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_pickscore
 
 num_devices: 8
-batch_size: 24
+batch_size: 9
 
 logging:
   report_to_wandb: true
@@ -57,7 +57,7 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: false
-    activation_checkpointing: false
+    activation_checkpointing: true
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -91,7 +91,7 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion]
-  forward_batch_size: 4
+  forward_batch_size: 2
 
 # Reward is optional for OPD (not used in loss). Kept for monitoring only.
 reward:
@@ -128,7 +128,7 @@ algorithm:
 
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 4
+  micro_batch_size: 3
   max_grad_norm: 1.0
   num_updates_per_batch: 1
 
