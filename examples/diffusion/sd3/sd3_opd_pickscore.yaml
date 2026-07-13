@@ -1,13 +1,17 @@
 # @package _global_
-# DiffusionOPD — On-Policy Distillation for SD3.5-Medium.
+# DiffusionOPD — Multi-Teacher On-Policy Distillation for SD3.5-Medium.
 #
-# Distills task-specific teacher LoRA adapters into a unified student via
-# closed-form per-step KL matching on the student's own rollout trajectories.
+# Distills 3 task-specific teacher LoRA adapters (aesthetics/OCR/GenEval) into
+# a unified student via closed-form per-step KL matching on the student's own
+# rollout trajectories. Matches the MOPD configuration from the paper.
+#
+# Teachers (frozen LoRA adapters from HuggingFace):
+#   - quanhaol/Aes-Teacher     (PickScore, aesthetics)
+#   - quanhaol/OCR-Teacher     (OCR accuracy)
+#   - quanhaol/GenEval-Teacher  (compositional generation)
+#
 # No external reward model needed — supervision is purely from teacher adapters.
-#
-# Architecture: same as FlowGRPO SD3 (JointTransformerBlock, 3D VAE, T5+CLIP).
-# The student trains a LoRA "default" adapter; teachers are frozen LoRA adapters
-# loaded from pre-trained checkpoints (train each teacher independently first).
+# PickScore reward kept for monitoring only (not used in loss).
 #
 # Launch (1 node × 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_pickscore
@@ -20,7 +24,7 @@ logging:
   project_name: ${oc.env:WANDB_PROJECT,unirl-sd3-opd}
   run_name: null
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [sd3, opd, distillation, pickscore]
+  tags: [sd3, opd, distillation, multi-teacher, pickscore, ocr, geneval]
   log_media: true
   media_max_items: 4
   media_log_interval: 200
@@ -112,6 +116,12 @@ algorithm:
     - name: pickscore
       lora_path: ${oc.env:TEACHER_PICKSCORE_PATH,quanhaol/Aes-Teacher}
       guidance_scale: 4.5
+    - name: ocr
+      lora_path: ${oc.env:TEACHER_OCR_PATH,quanhaol/OCR-Teacher}
+      guidance_scale: 4.5
+    - name: geneval
+      lora_path: ${oc.env:TEACHER_GENEVAL_PATH,quanhaol/GenEval-Teacher}
+      guidance_scale: 1.0
 
 stack:
   _target_: unirl.train.stack.TrainStack
