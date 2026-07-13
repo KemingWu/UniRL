@@ -1,0 +1,149 @@
+# @package _global_
+# DiffusionOPD — On-Policy Distillation for SD3.5-Medium.
+#
+# Distills task-specific teacher LoRA adapters into a unified student via
+# closed-form per-step KL matching on the student's own rollout trajectories.
+# No external reward model needed — supervision is purely from teacher adapters.
+#
+# Architecture: same as FlowGRPO SD3 (JointTransformerBlock, 3D VAE, T5+CLIP).
+# The student trains a LoRA "default" adapter; teachers are frozen LoRA adapters
+# loaded from pre-trained checkpoints (train each teacher independently first).
+#
+# Launch (1 node × 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_pickscore
+
+num_devices: 8
+batch_size: 24
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sd3-opd}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sd3, opd, distillation, pickscore]
+  log_media: true
+  media_max_items: 4
+  media_log_interval: 200
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 4
+
+# Reward is optional for OPD (not used in loss). Kept for monitoring only.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.diffusionopd.DiffusionOPD
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+  noise_level: 0.0
+  teacher_guidance_scale: 4.5
+  teachers:
+    - name: pickscore
+      lora_path: ${oc.env:TEACHER_PICKSCORE_PATH,quanhaol/Aes-Teacher}
+      guidance_scale: 4.5
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 4
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 4.5
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 1
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 10
+    timestep_fraction: [0, 0.99]

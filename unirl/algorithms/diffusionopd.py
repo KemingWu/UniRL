@@ -1,0 +1,301 @@
+"""DiffusionOPD — On-Policy Distillation for diffusion models.
+
+Implements the algorithm from "DiffusionOPD: A Unified Perspective of On-Policy
+Distillation in Diffusion Models" (arXiv 2605.15055). The student is trained to
+match teacher denoising transitions via a closed-form per-step KL objective:
+
+- **SDE mode** (noise_level > 0): KL = (μ_student - μ_teacher)² / (2σ²)
+- **ODE mode** (noise_level = 0): mean-matching = 0.5 * (μ_student - μ_teacher)²
+
+No external reward model is needed — supervision comes entirely from the teacher
+adapter(s). Multiple teachers can be distilled via round-robin cycling (one
+teacher per rollout batch).
+
+Teacher adapters are loaded as frozen PEFT LoRA adapters on the same backbone;
+``set_adapter(teacher_name)`` switches the active adapter before replay.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
+
+import torch
+
+from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm, typed_conditions
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
+    """Temporarily switch a PeftModel's active adapter, restoring on exit."""
+    prev = None
+    if hasattr(model, "active_adapter"):
+        prev = model.active_adapter
+        if isinstance(prev, list):
+            prev = prev[0] if prev else "default"
+    model.set_adapter(adapter_name)
+    try:
+        yield
+    finally:
+        if prev is not None:
+            model.set_adapter(prev)
+
+
+def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
+    """Compute the SDE transition std_var from the sigma schedule.
+
+    Mirrors FlowSDEStrategy.step:
+        dt = sigma_next - sigma
+        std_dev_t = sqrt(sigma / (1 - clamp(sigma, max=sigma_max))) * eta
+        std_var = std_dev_t * sqrt(-dt)
+    """
+    sigma = sigmas[step_idx].float()
+    sigma_next = sigmas[step_idx + 1].float()
+    dt = sigma_next - sigma
+    sigma_max = float(sigmas[1].item()) if sigmas.shape[0] > 1 else 0.99
+    sigma_clamped = torch.where(sigma == 1.0, torch.tensor(sigma_max), sigma)
+    std_dev_t = torch.sqrt(sigma / (1.0 - sigma_clamped)) * eta
+    std_var = std_dev_t * torch.sqrt(-dt)
+    return std_var
+
+
+@dataclass
+class DiffusionOPDConfig:
+    """Typed config for the DiffusionOPD algorithm."""
+
+    stage_attr: str = "diffusion"
+    conditions_cls: Optional[str] = None
+    params: Any = None
+    teachers: List[Dict[str, Any]] = field(default_factory=list)
+    noise_level: float = 0.0
+    teacher_guidance_scale: float = 4.5
+
+
+class DiffusionOPD(StageAlgorithm):
+    """On-Policy Distillation for diffusion models (multi-teacher).
+
+    Does NOT consume advantages — supervision is purely from teacher transition
+    means. The algorithm still satisfies the ``StageAlgorithm`` interface so the
+    standard ``DiffusionTrainer`` can host it without modification (it simply
+    ignores the ``advantages`` arg in ``compute_loss_and_backward``).
+    """
+
+    requires_ema_rollout = False
+    supports_multi_update = False
+    requires_backend = False
+    anchor_fields = ()
+
+    def __init__(
+        self,
+        *,
+        params: Any,
+        stage: Any = None,
+        pipeline: Any = None,
+        stage_attr: str = "diffusion",
+        backend: Any = None,
+        conditions_cls: Optional[Type[Any]] = None,
+        teachers: Optional[List[Dict[str, Any]]] = None,
+        noise_level: float = 0.0,
+        teacher_guidance_scale: float = 4.5,
+    ) -> None:
+        super().__init__()
+        if stage is None and pipeline is None:
+            raise ValueError("DiffusionOPD: either `stage` or `pipeline` must be provided")
+        if stage is None:
+            stage = getattr(pipeline, stage_attr)
+        self.stage = stage
+        self.params = params
+        self.conditions_cls = conditions_cls
+        self.noise_level = float(noise_level)
+        self.teacher_guidance_scale = float(teacher_guidance_scale)
+
+        if not teachers:
+            raise ValueError("DiffusionOPD requires at least one teacher in `teachers` list.")
+        self.teachers = list(teachers)
+
+        # The trainable transformer — used for set_adapter calls.
+        # Resolved from the backend (FSDP-wrapped) or the pipeline's bundle.
+        self._transformer = None
+        if backend is not None and hasattr(backend, "model"):
+            self._transformer = backend.model
+        elif pipeline is not None:
+            bundle = getattr(pipeline, "bundle", None)
+            if bundle is not None:
+                self._transformer = getattr(bundle, "transformer", None)
+
+        # Load teacher adapters (frozen) onto the transformer.
+        if self._transformer is not None:
+            self._load_teacher_adapters()
+
+        # Per-rollout teacher means storage (set in prepare_segment).
+        self._teacher_means: Optional[torch.Tensor] = None
+
+    def _load_teacher_adapters(self) -> None:
+        """Load each teacher's LoRA adapter onto the shared transformer (frozen)."""
+        model = self._transformer
+        if not hasattr(model, "load_adapter"):
+            logger.warning(
+                "DiffusionOPD: transformer has no load_adapter method; teacher adapters must be pre-loaded externally."
+            )
+            return
+        for tc in self.teachers:
+            adapter_name = f"teacher_{tc['name']}"
+            lora_path = tc["lora_path"]
+            if adapter_name not in getattr(model, "peft_config", {}):
+                logger.info("DiffusionOPD: loading teacher adapter %s from %s", adapter_name, lora_path)
+                model.load_adapter(lora_path, adapter_name=adapter_name)
+            # Freeze teacher adapter parameters
+            for n, p in model.named_parameters():
+                if adapter_name in n:
+                    p.requires_grad = False
+        # Restore student adapter
+        model.set_adapter("default")
+
+    @property
+    def requires_prepare(self) -> bool:
+        return True
+
+    def prepare_segment(
+        self,
+        *,
+        conditions: Mapping[str, Any],
+        segment: Any,
+    ) -> None:
+        """Query each teacher on the student's rollout trajectory (no grad).
+
+        For each teacher adapter, replay the student trajectory and store the
+        teacher's ``prev_sample_means`` — the per-step denoising transition mean
+        under the teacher policy. These are consumed by ``compute_loss_and_backward``
+        as the distillation target.
+        """
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+
+        # Determine target SDE steps (same as FlowGRPO).
+        sde_indices = segment.sde_indices
+        if sde_indices is None:
+            self._teacher_means = None
+            return
+        target_steps = sde_indices.tolist()
+
+        teacher_means_list: List[torch.Tensor] = []
+        model = self._transformer
+
+        for tc in self.teachers:
+            adapter_name = f"teacher_{tc['name']}"
+            with torch.no_grad(), _use_adapter(model, adapter_name):
+                result = self.stage.replay(
+                    typed_conds,
+                    segment=segment,
+                    params=self.params,
+                    step_indices=target_steps,
+                )
+            if result.prev_sample_means is not None:
+                teacher_means_list.append(result.prev_sample_means.detach())
+            else:
+                logger.warning(
+                    "DiffusionOPD: teacher %s returned None prev_sample_means; "
+                    "OPD requires the stage's replay to produce means.",
+                    tc["name"],
+                )
+
+        # Restore student adapter
+        if model is not None:
+            model.set_adapter("default")
+
+        if teacher_means_list:
+            # Stack: [B, S', K, *latent_shape]
+            self._teacher_means = torch.stack(teacher_means_list, dim=2)
+        else:
+            self._teacher_means = None
+
+    def compute_loss_and_backward(
+        self,
+        *,
+        conditions: Mapping[str, Any],
+        segment: Any,
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+    ) -> AlgorithmStepResult:
+        """Compute the OPD distillation loss and backward.
+
+        OPD does NOT use ``advantages`` — supervision is purely from the teacher
+        transition means stored in ``prepare_segment``.
+        """
+        if self._teacher_means is None:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        sde_indices = segment.sde_indices
+        if sde_indices is None:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+        target_steps = sde_indices.tolist()
+
+        # Student replay (with grad) to get student_prev_sample_means.
+        replay_result = self.stage.replay(
+            typed_conds,
+            segment=segment,
+            params=self.params,
+            step_indices=target_steps,
+        )
+        student_means = replay_result.prev_sample_means  # [B, S', *latent]
+        if student_means is None:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+
+        # teacher_means: [B, S', K, *latent] (from prepare_segment)
+        teacher_means = self._teacher_means.to(device=student_means.device, dtype=student_means.dtype)
+
+        # delta: [B, S', K, *latent]
+        # student_means is [B, S', *latent] -> unsqueeze dim=2 for broadcast
+        delta = student_means.unsqueeze(2) - teacher_means
+
+        # Compute per-step KL
+        if self.noise_level > 0.0:
+            # SDE mode: KL = delta² / (2σ²)
+            # Compute std_var for each SDE step from the sigma schedule.
+            sigmas = segment.sigmas.to(student_means.device)
+            eta = float(getattr(self.params, "eta", 1.0))
+            std_vars = []
+            for step_idx in target_steps:
+                sv = _compute_std_var(sigmas, step_idx, eta)
+                std_vars.append(sv)
+            # std_vars: [S'] scalars -> broadcast to [1, S', 1, 1, 1, 1]
+            std_var_t = torch.stack(std_vars).to(student_means.device, student_means.dtype)
+            # Reshape for broadcasting: [S'] -> [1, S', 1, ...]
+            while std_var_t.dim() < delta.dim():
+                std_var_t = std_var_t.unsqueeze(-1)
+            std_var_t = std_var_t.unsqueeze(0)  # [1, S', 1, ...]
+            sigma_sq = (std_var_t**2).clamp(min=1e-8)
+            per_step_kl = (delta**2) / (2.0 * sigma_sq)
+        else:
+            # ODE mode: mean-matching = 0.5 * delta²
+            per_step_kl = 0.5 * (delta**2)
+
+        # Reduce: mean over latent dims, sum over teachers (K), mean over steps (S') and batch (B)
+        # [B, S', K, *latent] -> mean over latent dims -> [B, S', K]
+        per_step_kl_scalar = per_step_kl.mean(dim=tuple(range(3, per_step_kl.ndim)))
+        # Sum over teachers (K dim)
+        per_step_kl_per_sample = per_step_kl_scalar.sum(dim=2)  # [B, S']
+        # Mean over steps and batch
+        distill_loss = per_step_kl_per_sample.mean()
+
+        loss = distill_loss
+        (loss * loss_scale).backward()
+
+        metrics: Dict[str, Any] = {
+            "distill_loss": float(distill_loss.detach().item()),
+            "per_step_kl_mean": float(per_step_kl_per_sample.detach().mean().item()),
+        }
+        return AlgorithmStepResult(
+            loss=float(loss.detach().item()),
+            metrics=metrics,
+            num_steps_or_tokens=len(target_steps),
+            has_backward=True,
+        )
+
+
+__all__ = ["DiffusionOPD", "DiffusionOPDConfig"]
