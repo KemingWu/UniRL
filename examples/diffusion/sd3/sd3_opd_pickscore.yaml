@@ -158,5 +158,5 @@ sampling:
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
-    num_sde_steps: 10
-    timestep_fraction: [0, 0.99]
+    num_sde_steps: 5
+    timestep_fraction: [0, 0.5]
