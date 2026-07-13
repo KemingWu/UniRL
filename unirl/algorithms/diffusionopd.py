@@ -31,18 +31,23 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
-    """Temporarily switch a PeftModel's active adapter, restoring on exit."""
-    prev = None
-    if hasattr(model, "active_adapter"):
-        prev = model.active_adapter
-        if isinstance(prev, list):
-            prev = prev[0] if prev else "default"
-    model.set_adapter(adapter_name)
+    """Temporarily switch active LoRA adapter at the LoraLayer level, restoring on exit.
+
+    Works with models that use ``peft.inject_adapter_in_model`` (UniRL's pattern)
+    rather than the full ``PeftModel`` wrapper.
+    """
+    from peft.tuners.lora import LoraLayer
+
+    layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
+    prev_adapters = [getattr(m, "active_adapter", ["default"]) for m in layers]
     try:
+        for m in layers:
+            m.set_adapter(adapter_name)
         yield
     finally:
-        if prev is not None:
-            model.set_adapter(prev)
+        for m, prev in zip(layers, prev_adapters):
+            prev_name = prev[0] if isinstance(prev, list) else prev
+            m.set_adapter(prev_name)
 
 
 def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
@@ -139,25 +144,93 @@ class DiffusionOPD(StageAlgorithm):
         self._rollout_counter: int = 0
 
     def _load_teacher_adapters(self) -> None:
-        """Load each teacher's LoRA adapter onto the shared transformer (frozen)."""
+        """Load each teacher's LoRA adapter onto the shared transformer (frozen).
+
+        UniRL uses ``peft.inject_adapter_in_model`` (not ``get_peft_model``), so
+        the model is NOT a PeftModel — it has LoRA layers but not the high-level
+        ``.load_adapter()`` / ``.set_adapter()`` API. We inject each teacher as a
+        separate named adapter using the same low-level API, then freeze its
+        params. Switching adapters is done at the LoraLayer level.
+        """
+        from peft import LoraConfig as PeftLoraConfig
+        from peft import inject_adapter_in_model, set_peft_model_state_dict
+        from peft.tuners.lora import LoraLayer
+        from safetensors.torch import load_file as safe_load
+
         model = self._transformer
-        if not hasattr(model, "load_adapter"):
-            logger.warning(
-                "DiffusionOPD: transformer has no load_adapter method; teacher adapters must be pre-loaded externally."
-            )
-            return
+
         for tc in self.teachers:
             adapter_name = f"teacher_{tc['name']}"
             lora_path = tc["lora_path"]
-            if adapter_name not in getattr(model, "peft_config", {}):
-                logger.info("DiffusionOPD: loading teacher adapter %s from %s", adapter_name, lora_path)
-                model.load_adapter(lora_path, adapter_name=adapter_name)
-            # Freeze teacher adapter parameters
-            for n, p in model.named_parameters():
-                if adapter_name in n:
-                    p.requires_grad = False
-        # Restore student adapter
-        model.set_adapter("default")
+
+            # Check if adapter already injected (idempotent).
+            has_adapter = any(
+                adapter_name in getattr(m, "lora_A", {})
+                for m in model.modules()
+                if isinstance(m, LoraLayer)
+            )
+            if has_adapter:
+                continue
+
+            logger.info("DiffusionOPD: loading teacher adapter %s from %s", adapter_name, lora_path)
+
+            # Load the LoRA config and weights from the HF checkpoint.
+            import json
+            import os
+
+            from huggingface_hub import hf_hub_download
+
+            # Resolve local or HF path.
+            if os.path.isdir(lora_path):
+                config_path = os.path.join(lora_path, "adapter_config.json")
+                weight_path = os.path.join(lora_path, "adapter_model.safetensors")
+                if not os.path.exists(weight_path):
+                    weight_path = os.path.join(lora_path, "adapter_model.bin")
+            else:
+                config_path = hf_hub_download(lora_path, "adapter_config.json")
+                try:
+                    weight_path = hf_hub_download(lora_path, "adapter_model.safetensors")
+                except Exception:
+                    weight_path = hf_hub_download(lora_path, "adapter_model.bin")
+
+            with open(config_path) as f:
+                adapter_cfg = json.load(f)
+
+            peft_cfg = PeftLoraConfig(
+                r=adapter_cfg.get("r", 32),
+                lora_alpha=adapter_cfg.get("lora_alpha", 64),
+                target_modules=adapter_cfg.get("target_modules", []),
+                lora_dropout=adapter_cfg.get("lora_dropout", 0.0),
+                bias=adapter_cfg.get("bias", "none"),
+            )
+
+            # Inject adapter structure (adds new LoRA A/B matrices under adapter_name).
+            inject_adapter_in_model(peft_cfg, model, adapter_name=adapter_name)
+
+            # Load weights.
+            if weight_path.endswith(".safetensors"):
+                state_dict = safe_load(weight_path)
+            else:
+                state_dict = torch.load(weight_path, map_location="cpu")
+            set_peft_model_state_dict(model, state_dict, adapter_name=adapter_name)
+
+            # Freeze teacher params.
+            for m in model.modules():
+                if isinstance(m, LoraLayer) and adapter_name in getattr(m, "lora_A", {}):
+                    m.lora_A[adapter_name].weight.requires_grad_(False)
+                    m.lora_B[adapter_name].weight.requires_grad_(False)
+
+        # Restore student adapter as active.
+        self._set_active_adapter(model, "default")
+
+    @staticmethod
+    def _set_active_adapter(model: Any, adapter_name: str) -> None:
+        """Switch active adapter at the LoraLayer level (no PeftModel needed)."""
+        from peft.tuners.lora import LoraLayer
+
+        for m in model.modules():
+            if isinstance(m, LoraLayer):
+                m.set_adapter(adapter_name)
 
     @property
     def requires_prepare(self) -> bool:
@@ -220,7 +293,7 @@ class DiffusionOPD(StageAlgorithm):
             )
 
         if model is not None:
-            model.set_adapter("default")
+            self._set_active_adapter(model, "default")
 
         if result.prev_sample_means is not None:
             # Shape: [B, S', 1, *latent] — single teacher, K=1 dim for consistency.
