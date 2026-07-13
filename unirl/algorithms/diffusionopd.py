@@ -176,8 +176,12 @@ class DiffusionOPD(StageAlgorithm):
 
         The selected teacher's ``prev_sample_means`` (the per-step denoising
         transition mean under the teacher policy) are stored for
-        ``compute_loss_and_backward``.
+        ``compute_loss_and_backward``. The teacher's own ``guidance_scale`` is
+        used during replay (not the student's), matching the original paper where
+        each teacher was trained at its own CFG scale.
         """
+        import dataclasses
+
         typed_conds = typed_conditions(conditions, self.conditions_cls)
 
         sde_indices = segment.sde_indices
@@ -191,13 +195,18 @@ class DiffusionOPD(StageAlgorithm):
         self._rollout_counter += 1
         tc = self.teachers[teacher_idx]
 
+        # Use the teacher's own guidance_scale for replay (each teacher was
+        # trained at its own CFG scale; e.g. GenEval uses 1.0 while others use 4.5).
+        teacher_gs = float(tc.get("guidance_scale", self.teacher_guidance_scale))
+        teacher_params = dataclasses.replace(self.params, guidance_scale=teacher_gs)
+
         model = self._transformer
         adapter_name = f"teacher_{tc['name']}"
         with torch.no_grad(), _use_adapter(model, adapter_name):
             result = self.stage.replay(
                 typed_conds,
                 segment=segment,
-                params=self.params,
+                params=teacher_params,
                 step_indices=target_steps,
             )
 

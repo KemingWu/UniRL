@@ -139,6 +139,9 @@ data_source:
       # Merged prompts from all 3 teacher domains (pickscore + ocr + geneval).
       # Round-robin teacher selection in the algorithm ensures each rollout batch
       # is supervised by one teacher, cycling through all domains.
+      # NOTE: the original paper uses per-teacher dataloaders (each teacher only
+      # sees its own domain prompts). This merged approach is a simplification;
+      # per-teacher data routing requires trainer-level changes (follow-up).
       data_path: datasets/opd_merged/train.txt
       eval_data_path: datasets/opd_merged/test.txt
       seed: 42
