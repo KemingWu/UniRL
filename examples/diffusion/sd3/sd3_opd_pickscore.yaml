@@ -38,10 +38,9 @@ bundle:
     shift: 3.0
 
 pipeline:
-  _target_: unirl.models.sd3.pipeline.SD3Pipeline.from_config
-  config: ${bundle.config}
-  strategy:
-    _target_: unirl.sde.kernels.FlowSDEStrategy
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
