@@ -86,7 +86,7 @@ class DiffusionOPD(StageAlgorithm):
 
     requires_ema_rollout = False
     supports_multi_update = False
-    requires_backend = False
+    requires_backend = True
     anchor_fields = ()
 
     def __init__(

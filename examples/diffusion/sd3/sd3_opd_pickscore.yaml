@@ -41,6 +41,10 @@ pipeline:
   _target_: unirl.models.sd3.pipeline.SD3Pipeline
   shift: 3.0
   autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
