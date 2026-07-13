@@ -128,8 +128,10 @@ class DiffusionOPD(StageAlgorithm):
                 self._transformer = getattr(bundle, "transformer", None)
 
         # Load teacher adapters (frozen) onto the transformer.
-        if self._transformer is not None:
-            self._load_teacher_adapters()
+        # Deferred to first prepare_segment call because at __init__ time the
+        # transformer may not yet be wrapped as a PeftModel (LoRA injection
+        # happens later in the FSDPBackend lifecycle).
+        self._teachers_loaded = False
 
         # Per-rollout teacher means storage (set in prepare_segment).
         self._teacher_means: Optional[torch.Tensor] = None
@@ -183,6 +185,13 @@ class DiffusionOPD(StageAlgorithm):
         import dataclasses
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
+
+        # Deferred teacher loading: at __init__ time the transformer is not yet
+        # a PeftModel (LoRA injection happens in FSDPBackend after algorithm
+        # construction). Load teacher adapters on first prepare_segment call.
+        if not self._teachers_loaded and self._transformer is not None:
+            self._load_teacher_adapters()
+            self._teachers_loaded = True
 
         sde_indices = segment.sde_indices
         if sde_indices is None:
