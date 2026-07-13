@@ -38,7 +38,7 @@ bundle:
     shift: 3.0
 
 pipeline:
-  _target_: unirl.models.sd3.pipeline.SD3Pipeline.from_bundle
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline.from_config
   config: ${bundle.config}
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
