@@ -133,6 +133,8 @@ class DiffusionOPD(StageAlgorithm):
 
         # Per-rollout teacher means storage (set in prepare_segment).
         self._teacher_means: Optional[torch.Tensor] = None
+        # Round-robin counter: cycles through teachers across rollouts.
+        self._rollout_counter: int = 0
 
     def _load_teacher_adapters(self) -> None:
         """Load each teacher's LoRA adapter onto the shared transformer (frozen)."""
@@ -165,51 +167,52 @@ class DiffusionOPD(StageAlgorithm):
         conditions: Mapping[str, Any],
         segment: Any,
     ) -> None:
-        """Query each teacher on the student's rollout trajectory (no grad).
+        """Query the current round-robin teacher on the student's rollout trajectory.
 
-        For each teacher adapter, replay the student trajectory and store the
-        teacher's ``prev_sample_means`` — the per-step denoising transition mean
-        under the teacher policy. These are consumed by ``compute_loss_and_backward``
-        as the distillation target.
+        Following the paper's MOPD protocol: each rollout batch is supervised by
+        ONE teacher (round-robin cycling across rollouts). This matches the
+        original per-batch teacher assignment where batch_i uses
+        teachers[i % K].
+
+        The selected teacher's ``prev_sample_means`` (the per-step denoising
+        transition mean under the teacher policy) are stored for
+        ``compute_loss_and_backward``.
         """
         typed_conds = typed_conditions(conditions, self.conditions_cls)
 
-        # Determine target SDE steps (same as FlowGRPO).
         sde_indices = segment.sde_indices
         if sde_indices is None:
             self._teacher_means = None
             return
         target_steps = sde_indices.tolist()
 
-        teacher_means_list: List[torch.Tensor] = []
+        # Round-robin teacher selection (paper: each batch uses one teacher).
+        teacher_idx = self._rollout_counter % len(self.teachers)
+        self._rollout_counter += 1
+        tc = self.teachers[teacher_idx]
+
         model = self._transformer
+        adapter_name = f"teacher_{tc['name']}"
+        with torch.no_grad(), _use_adapter(model, adapter_name):
+            result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=target_steps,
+            )
 
-        for tc in self.teachers:
-            adapter_name = f"teacher_{tc['name']}"
-            with torch.no_grad(), _use_adapter(model, adapter_name):
-                result = self.stage.replay(
-                    typed_conds,
-                    segment=segment,
-                    params=self.params,
-                    step_indices=target_steps,
-                )
-            if result.prev_sample_means is not None:
-                teacher_means_list.append(result.prev_sample_means.detach())
-            else:
-                logger.warning(
-                    "DiffusionOPD: teacher %s returned None prev_sample_means; "
-                    "OPD requires the stage's replay to produce means.",
-                    tc["name"],
-                )
-
-        # Restore student adapter
         if model is not None:
             model.set_adapter("default")
 
-        if teacher_means_list:
-            # Stack: [B, S', K, *latent_shape]
-            self._teacher_means = torch.stack(teacher_means_list, dim=2)
+        if result.prev_sample_means is not None:
+            # Shape: [B, S', 1, *latent] — single teacher, K=1 dim for consistency.
+            self._teacher_means = result.prev_sample_means.detach().unsqueeze(2)
         else:
+            logger.warning(
+                "DiffusionOPD: teacher %s returned None prev_sample_means; "
+                "OPD requires the stage's replay to produce means.",
+                tc["name"],
+            )
             self._teacher_means = None
 
     def compute_loss_and_backward(
