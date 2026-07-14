@@ -31,23 +31,36 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
-    """Temporarily switch active LoRA adapter at the LoraLayer level, restoring on exit.
+    """Temporarily switch active LoRA adapter at the LoraLayer level.
 
-    Works with models that use ``peft.inject_adapter_in_model`` (UniRL's pattern)
-    rather than the full ``PeftModel`` wrapper.
+    Directly manipulates ``active_adapter`` on each LoraLayer — the same
+    low-level approach as ``unirl.train.lora.adapters_disabled`` which is
+    confirmed to work under FSDP. Using ``LoraLayer.set_adapter()`` alone
+    may not propagate through FSDP wrappers consistently.
     """
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-    prev_adapters = [getattr(m, "active_adapter", ["default"]) for m in layers]
+    # Save previous active adapters
+    prev_adapters = []
+    for m in layers:
+        aa = getattr(m, "active_adapter", None)
+        if isinstance(aa, list):
+            prev_adapters.append(list(aa))
+        elif isinstance(aa, str):
+            prev_adapters.append([aa])
+        else:
+            prev_adapters.append(["default"])
+
     try:
+        # Switch to teacher adapter
         for m in layers:
-            m.set_adapter(adapter_name)
+            m.active_adapter = [adapter_name]
         yield
     finally:
+        # Restore previous adapters
         for m, prev in zip(layers, prev_adapters):
-            prev_name = prev[0] if isinstance(prev, list) else prev
-            m.set_adapter(prev_name)
+            m.active_adapter = prev
 
 
 def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
@@ -312,6 +325,26 @@ class DiffusionOPD(StageAlgorithm):
         if result.prev_sample_means is not None:
             # Shape: [B, S', 1, *latent] — single teacher, K=1 dim for consistency.
             self._teacher_means = result.prev_sample_means.detach().unsqueeze(2)
+            # Debug: verify teacher adapter actually changed the output.
+            # Do a quick student replay to compare.
+            with torch.no_grad():
+                student_result = self.stage.replay(
+                    typed_conds,
+                    segment=segment,
+                    params=self.params,
+                    step_indices=target_steps[:1],  # just first step for speed
+                )
+            if student_result.prev_sample_means is not None:
+                t_mean = result.prev_sample_means[:, 0].float()
+                s_mean = student_result.prev_sample_means[:, 0].float()
+                delta_norm = (t_mean - s_mean).norm().item()
+                logger.info(
+                    "DiffusionOPD[%s]: teacher-student delta norm at step %d = %.6f "
+                    "(should be >> 0 if adapter switch works)",
+                    tc["name"],
+                    target_steps[0],
+                    delta_norm,
+                )
         else:
             logger.warning(
                 "DiffusionOPD: teacher %s returned None prev_sample_means; "
