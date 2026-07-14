@@ -165,5 +165,7 @@ sampling:
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
-    num_sde_steps: 5
-    timestep_fraction: [0, 0.5]
+    # OPD needs ALL steps distilled (unlike GRPO which uses sparse SDE).
+    # Original paper: timestep_fraction=0.99 → 9/10 steps trained.
+    num_sde_steps: 9
+    timestep_fraction: [0, 0.99]
