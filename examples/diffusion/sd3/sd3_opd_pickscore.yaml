@@ -62,11 +62,11 @@ backend:
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 1.0e-4
+    learning_rate: 3.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
-    weight_decay: 0.0
+    weight_decay: 1.0e-4
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
     type: constant
@@ -155,7 +155,12 @@ sampling:
   guidance_scale: 4.5
   height: 512
   width: 512
-  eta: 0.7
+  # OPD uses deterministic ODE sampling (noise_level=0, eta=0) — both rollout
+  # and replay are fully deterministic. The original paper's solver="flow" with
+  # noise_level=0 produces std_dev_t=0, making SDE collapse to ODE.
+  # Use eta=1e-6 (not exactly 0) so the SDE strategy still produces log_probs
+  # (stage.replay raises if log_prob is None). The noise scale is negligible.
+  eta: 1.0e-6
   samples_per_prompt: 1
   seed: 42
   init_same_noise: false
