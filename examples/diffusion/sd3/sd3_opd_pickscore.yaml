@@ -17,7 +17,7 @@
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_pickscore
 
 num_devices: 8
-batch_size: 9
+batch_size: 8
 
 logging:
   report_to_wandb: true
