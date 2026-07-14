@@ -57,7 +57,7 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: false
-    activation_checkpointing: true
+    activation_checkpointing: false
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
