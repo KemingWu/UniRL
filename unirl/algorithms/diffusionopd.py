@@ -31,37 +31,43 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
-    """Temporarily switch active LoRA adapter at the LoraLayer level.
+    """Temporarily switch to a teacher adapter by disabling the student LoRA
+    and enabling the teacher LoRA on each LoraLayer.
 
-    In newer PEFT versions ``active_adapter`` is a read-only property backed by
-    ``_active_adapter``. We write to the backing attribute directly (same
-    approach as ``unirl.train.lora.adapters_disabled`` uses ``_disable_adapters``).
+    Strategy: for each LoraLayer that has the teacher adapter injected,
+    disable the student ("default") contribution and enable the teacher's.
+    This is done by manipulating the ``scaling`` dict — setting the student
+    scale to 0 and the teacher scale to its normal value (alpha/r).
     """
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-    # Save previous active adapters (read from property or backing attr).
-    prev_adapters = []
+
+    # Save original scaling values and set up teacher.
+    saved_scalings: list = []
     for m in layers:
-        aa = getattr(m, "_active_adapter", None) or getattr(m, "active_adapter", ["default"])
-        if isinstance(aa, str):
-            aa = [aa]
-        prev_adapters.append(list(aa))
+        scaling = getattr(m, "scaling", {})
+        saved_scalings.append(dict(scaling))
+
+        # Zero out student adapter contribution.
+        if "default" in scaling:
+            scaling["default"] = 0.0
+        # Activate teacher adapter at its normal scaling.
+        if adapter_name in scaling:
+            pass  # already at correct value from injection
+        elif adapter_name in getattr(m, "lora_A", {}):
+            # Compute scaling = alpha / r
+            r = getattr(m, "r", {}).get(adapter_name, 32)
+            alpha = getattr(m, "lora_alpha", {}).get(adapter_name, 64)
+            scaling[adapter_name] = alpha / r
 
     try:
-        for m in layers:
-            # Write to the backing attribute that the property reads from.
-            if hasattr(m, "_active_adapter"):
-                m._active_adapter = [adapter_name]
-            else:
-                object.__setattr__(m, "active_adapter", [adapter_name])
         yield
     finally:
-        for m, prev in zip(layers, prev_adapters):
-            if hasattr(m, "_active_adapter"):
-                m._active_adapter = prev
-            else:
-                object.__setattr__(m, "active_adapter", prev)
+        # Restore original scaling values.
+        for m, saved in zip(layers, saved_scalings):
+            s = getattr(m, "scaling", {})
+            s.update(saved)
 
 
 def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
