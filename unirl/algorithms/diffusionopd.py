@@ -33,34 +33,35 @@ logger = logging.getLogger(__name__)
 def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
     """Temporarily switch active LoRA adapter at the LoraLayer level.
 
-    Directly manipulates ``active_adapter`` on each LoraLayer — the same
-    low-level approach as ``unirl.train.lora.adapters_disabled`` which is
-    confirmed to work under FSDP. Using ``LoraLayer.set_adapter()`` alone
-    may not propagate through FSDP wrappers consistently.
+    In newer PEFT versions ``active_adapter`` is a read-only property backed by
+    ``_active_adapter``. We write to the backing attribute directly (same
+    approach as ``unirl.train.lora.adapters_disabled`` uses ``_disable_adapters``).
     """
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-    # Save previous active adapters
+    # Save previous active adapters (read from property or backing attr).
     prev_adapters = []
     for m in layers:
-        aa = getattr(m, "active_adapter", None)
-        if isinstance(aa, list):
-            prev_adapters.append(list(aa))
-        elif isinstance(aa, str):
-            prev_adapters.append([aa])
-        else:
-            prev_adapters.append(["default"])
+        aa = getattr(m, "_active_adapter", None) or getattr(m, "active_adapter", ["default"])
+        if isinstance(aa, str):
+            aa = [aa]
+        prev_adapters.append(list(aa))
 
     try:
-        # Switch to teacher adapter
         for m in layers:
-            m.active_adapter = [adapter_name]
+            # Write to the backing attribute that the property reads from.
+            if hasattr(m, "_active_adapter"):
+                m._active_adapter = [adapter_name]
+            else:
+                object.__setattr__(m, "active_adapter", [adapter_name])
         yield
     finally:
-        # Restore previous adapters
         for m, prev in zip(layers, prev_adapters):
-            m.active_adapter = prev
+            if hasattr(m, "_active_adapter"):
+                m._active_adapter = prev
+            else:
+                object.__setattr__(m, "active_adapter", prev)
 
 
 def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
