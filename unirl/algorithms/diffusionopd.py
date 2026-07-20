@@ -31,43 +31,33 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _use_adapter(model: Any, adapter_name: str) -> Iterator[None]:
-    """Temporarily switch to a teacher adapter by disabling the student LoRA
-    and enabling the teacher LoRA on each LoraLayer.
+    """Temporarily route every LoraLayer through ``adapter_name``.
 
-    Strategy: for each LoraLayer that has the teacher adapter injected,
-    disable the student ("default") contribution and enable the teacher's.
-    This is done by manipulating the ``scaling`` dict — setting the student
-    scale to 0 and the teacher scale to its normal value (alpha/r).
+    PEFT ``LoraLayer.forward`` iterates over ``self.active_adapters`` and applies
+    each adapter's A/B matrices. Merely tweaking the ``scaling`` dict does NOT
+    switch the adapter — the teacher's A/B are never executed unless it appears
+    in ``active_adapter``. We write directly to the ``_active_adapter`` backing
+    attribute (same pattern as ``unirl.train.lora.adapters_disabled`` uses
+    ``_disable_adapters``). Direct attribute writes avoid PEFT's
+    ``LoraLayer.set_adapter()`` side-effects (which flip ``requires_grad`` and
+    can misbehave once FSDP has sharded the params).
     """
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-
-    # Save original scaling values and set up teacher.
-    saved_scalings: list = []
+    prev: list = []
     for m in layers:
-        scaling = getattr(m, "scaling", {})
-        saved_scalings.append(dict(scaling))
-
-        # Zero out student adapter contribution.
-        if "default" in scaling:
-            scaling["default"] = 0.0
-        # Activate teacher adapter at its normal scaling.
-        if adapter_name in scaling:
-            pass  # already at correct value from injection
-        elif adapter_name in getattr(m, "lora_A", {}):
-            # Compute scaling = alpha / r
-            r = getattr(m, "r", {}).get(adapter_name, 32)
-            alpha = getattr(m, "lora_alpha", {}).get(adapter_name, 64)
-            scaling[adapter_name] = alpha / r
-
+        aa = getattr(m, "_active_adapter", None)
+        if aa is None:
+            aa = getattr(m, "active_adapter", "default")
+        prev.append(list(aa) if isinstance(aa, list) else [aa])
     try:
+        for m in layers:
+            m._active_adapter = [adapter_name]
         yield
     finally:
-        # Restore original scaling values.
-        for m, saved in zip(layers, saved_scalings):
-            s = getattr(m, "scaling", {})
-            s.update(saved)
+        for m, p in zip(layers, prev):
+            m._active_adapter = p
 
 
 def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.Tensor:
@@ -257,14 +247,43 @@ class DiffusionOPD(StageAlgorithm):
         # Restore student adapter as active.
         self._set_active_adapter(model, "default")
 
+        # PEFT's ``inject_adapter_in_model`` invokes ``set_adapter(<new>)`` as a
+        # side-effect while wiring up the new adapter, which flips
+        # ``requires_grad`` on ALL other adapters (including our student
+        # "default") to ``False``. We bypass PEFT's ``set_adapter()`` at
+        # runtime, so nothing restores it — student loss ends up with no
+        # grad_fn and ``backward()`` raises. Explicitly re-enable trainability
+        # on the student adapter after all teachers are loaded.
+        n_restored = 0
+        for m in model.modules():
+            if not isinstance(m, LoraLayer):
+                continue
+            for attr in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+                d = getattr(m, attr, None)
+                if d is None or "default" not in d:
+                    continue
+                for p in d["default"].parameters():
+                    p.requires_grad_(True)
+                    n_restored += 1
+        logger.info(
+            "DiffusionOPD: restored requires_grad=True on %d student ('default') LoRA params after teacher injection.",
+            n_restored,
+        )
+
     @staticmethod
     def _set_active_adapter(model: Any, adapter_name: str) -> None:
-        """Switch active adapter at the LoraLayer level (no PeftModel needed)."""
+        """Switch active adapter by directly writing ``_active_adapter``.
+
+        Same rationale as ``_use_adapter``: PEFT's ``LoraLayer.set_adapter()``
+        flips ``requires_grad`` on the adapters' weights, which is unsafe once
+        FSDP has sharded the params. Writing the backing attribute leaves
+        weights alone and only updates the routing metadata.
+        """
         from peft.tuners.lora import LoraLayer
 
         for m in model.modules():
             if isinstance(m, LoraLayer):
-                m.set_adapter(adapter_name)
+                m._active_adapter = [adapter_name]
 
     @property
     def requires_prepare(self) -> bool:

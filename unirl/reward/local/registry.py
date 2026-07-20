@@ -22,6 +22,7 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "hpsv2": ("unirl.reward.local.hpsv2", "HPSv2RewardScorer"),
     "ocr": ("unirl.reward.local.ocr", "OCRRewardScorer"),
     "pickscore": ("unirl.reward.local.pickscore", "PickScoreRewardScorer"),
+    "geneval": ("unirl.reward.local.geneval", "GenEvalRewardScorer"),
     "geneval2": ("unirl.reward.local.geneval2", "GenEval2RewardScorer"),
     "hpsv3": ("unirl.reward.local.hpsv3", "HPSv3RewardScorer"),
     "hpsv3pp": ("unirl.reward.local.hpsv3pp", "HPSv3PPRewardScorer"),
@@ -33,6 +34,7 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPRewardScorer"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainRewardScorer"),
 }
 
 _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
@@ -41,6 +43,7 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "hpsv2": ("unirl.reward.local.hpsv2", "HPSv2Spec"),
     "ocr": ("unirl.reward.local.ocr", "OCRSpec"),
     "pickscore": ("unirl.reward.local.pickscore", "PickScoreSpec"),
+    "geneval": ("unirl.reward.local.geneval", "GenEvalSpec"),
     "geneval2": ("unirl.reward.local.geneval2", "GenEval2Spec"),
     "hpsv3": ("unirl.reward.local.hpsv3", "HPSv3Spec"),
     "hpsv3pp": ("unirl.reward.local.hpsv3pp", "HPSv3PPSpec"),
@@ -52,6 +55,7 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPSpec"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindSpec"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeSpec"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainSpec"),
 }
 
 

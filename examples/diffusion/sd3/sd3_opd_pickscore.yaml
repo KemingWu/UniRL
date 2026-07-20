@@ -94,18 +94,51 @@ rollout:
   stage_attrs: [diffusion]
   forward_batch_size: 2
 
-# Reward is optional for OPD (not used in loss). Kept for monitoring only.
+# Reward is monitoring-only for OPD (loss is teacher-driven). Per-domain
+# scorer routes each batch to the correct scorer based on the data source's
+# ``metadata["teacher_domain"]`` tag, producing three independent wandb
+# curves (reward_pickscore / reward_ocr / reward_geneval).
+#
+# GenEval uses the classical mmdet-based scorer (Mask2Former + CLIP), which
+# is heavy and incompatible with the trainer's py3.12 venv. It runs on a
+# dedicated node (see ``launch_sd3_opd_2node.sh``) and this trainer talks to
+# it over HTTP via ``REWARD_SERVICE_URL``. PickScore and OCR stay local.
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    _target_: unirl.reward.local.per_domain.PerDomainRewardScorer
     base_device: cuda
     config:
-      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      _target_: unirl.reward.local.per_domain.PerDomainSpec
       batch_size: 8
       device: auto
-      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
-      model_id: yuvalkirstain/PickScore_v1
+      scorers:
+        pickscore:
+          _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.pickscore.PickScoreSpec
+            batch_size: 8
+            device: auto
+            processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+            model_id: yuvalkirstain/PickScore_v1
+        ocr:
+          _target_: unirl.reward.local.ocr.OCRRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.ocr.OCRSpec
+            # OCRSpec only accepts ``lang``: PaddleOCR runs on CPU
+            # sequentially, so batch_size / device don't apply.
+            lang: en
+        geneval:
+          _target_: unirl.reward.remote.RemoteRewardBackend
+          base_device: cpu
+          config:
+            _target_: unirl.reward.remote.RemoteRewardSpec
+            base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+            required_rewards: [geneval]
+            reward_weights: {geneval: 1.0}
+            timeout: 300.0
 
 algorithm:
   _target_: unirl.algorithms.diffusionopd.DiffusionOPD
@@ -134,17 +167,23 @@ stack:
   num_updates_per_batch: 1
 
 data_source:
-  _target_: unirl.data.data_source.MultimodalRLDataSource
+  _target_: unirl.data.multi_teacher_data_source.MultiTeacherRLDataSource
   args:
     run:
-      # Merged prompts from all 3 teacher domains (pickscore + ocr + geneval).
-      # Round-robin teacher selection in the algorithm ensures each rollout batch
-      # is supervised by one teacher, cycling through all domains.
-      # NOTE: the original paper uses per-teacher dataloaders (each teacher only
-      # sees its own domain prompts). This merged approach is a simplification;
-      # per-teacher data routing requires trainer-level changes (follow-up).
-      data_path: datasets/opd_merged/train.txt
-      eval_data_path: datasets/opd_merged/test.txt
+      # Per-teacher datasets: each teacher slot only sees its own domain's
+      # prompts, matching the original DiffusionOPD paper. The teachers list
+      # order MUST match the ``algorithm.teachers`` order below so that the
+      # algorithm's round-robin counter picks the same teacher as the batch.
+      teachers:
+        - name: pickscore
+          data_path: datasets/pickscore/train.txt
+          eval_data_path: datasets/pickscore/test.txt
+        - name: ocr
+          data_path: datasets/ocr/train.txt
+          eval_data_path: datasets/ocr/test.txt
+        - name: geneval
+          data_path: datasets/geneval/train_metadata.jsonl
+          eval_data_path: datasets/geneval/test_metadata.jsonl
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}

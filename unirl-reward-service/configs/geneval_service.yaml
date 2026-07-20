@@ -1,0 +1,43 @@
+# GenEval-only service configuration.
+#
+# Deploy on a dedicated node (1 GPU for Mask2Former + CLIP ViT-L/14).
+# The training node connects via REWARD_SERVICE_URL=http://<this_node_ip>:8080.
+#
+# Start (via 2-node launcher):
+#   ray start --head --port=6379 --num-gpus=1
+#   python -m reward_service --config configs/geneval_service.yaml
+#
+# Deps (mmdet 3.x + mmcv 2.x + open_clip + clip_benchmark) are installed by
+# the launcher into the base venv, NOT via Ray runtime_env (whose pip
+# isolation is broken on this image — see SUBMITTING_JOBS.md §5).
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 300.0
+
+rewards:
+  - name: geneval
+    scorer: geneval
+    runtime_env: envs/geneval.txt   # empty file; deps installed by launcher
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      # Empty ``mmdet_config`` / ``mmdet_checkpoint`` → the scorer's fallback
+      # picks the config that ships inside the installed mmdet 3.x package
+      # (``mask2former_swin-s_8xb2-lsj-50e_coco.py``) and downloads the
+      # Mask2Former Swin-S COCO-instance weights to ``$MASK2FORMER_CACHE_DIR``
+      # (defaults to ``/dev/shm/geneval``) on first run.
+      mmdet_config: ""
+      mmdet_checkpoint: ""
+      clip_arch: ViT-L-14
+      clip_pretrained: openai
+      score_type: score            # continuous reward, mirrors paper's `_evaluate_reward`
+      threshold: 0.3
+      counting_threshold: 0.9
+      max_objects: 16
+      nms_threshold: 1.0
+      position_threshold: 0.1
+      device: cuda
