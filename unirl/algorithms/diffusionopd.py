@@ -132,6 +132,17 @@ class DiffusionOPD(StageAlgorithm):
             raise ValueError("DiffusionOPD requires at least one teacher in `teachers` list.")
         self.teachers = list(teachers)
 
+        # Round-robin coupling: the data source (``MultiTeacherRLDataSource``)
+        # cycles its per-teacher dataloaders in the same order this list
+        # declares. If the two orders drift, batch N's prompts stop matching
+        # teacher N's domain — silently. Fail loudly at init if names look
+        # off (unique + non-empty).
+        _names = [str(t.get("name", "")) for t in self.teachers]
+        if any(not n for n in _names):
+            raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name', got {_names}")
+        if len(set(_names)) != len(_names):
+            raise ValueError(f"DiffusionOPD: teacher names must be unique, got {_names}")
+
         # The trainable transformer — used for set_adapter calls.
         # Resolved from the backend (FSDP-wrapped) or the pipeline's bundle.
         self._transformer = None
@@ -349,8 +360,9 @@ class DiffusionOPD(StageAlgorithm):
             self._set_active_adapter(model, "default")
 
         if result.prev_sample_means is not None:
-            # Shape: [B, S', 1, *latent] — single teacher, K=1 dim for consistency.
-            self._teacher_means = result.prev_sample_means.detach().unsqueeze(2)
+            # Shape: [B, S', *latent] — DiffusionOPD is per-batch one-teacher
+            # (round-robin), so there is no multi-teacher K dim to carry.
+            self._teacher_means = result.prev_sample_means.detach()
             # Debug: verify teacher adapter actually changed the output.
             # Do a quick student replay to compare.
             with torch.no_grad():
@@ -413,12 +425,15 @@ class DiffusionOPD(StageAlgorithm):
         if student_means is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
-        # teacher_means: [B, S', K, *latent] (from prepare_segment)
-        teacher_means = self._teacher_means.to(device=student_means.device, dtype=student_means.dtype)
+        # Cast BOTH sides to fp32 before the squared-difference. Under autocast
+        # the replay returns bf16 means, and squaring in bf16 loses precision
+        # fast (the KL is a per-pixel MSE reduced over ~65k elements). Flow-
+        # Factory does the same (trainers/opd/trainer.py:339).
+        student_means_fp32 = student_means.float()
+        teacher_means = self._teacher_means.to(device=student_means.device, dtype=torch.float32)
 
-        # delta: [B, S', K, *latent]
-        # student_means is [B, S', *latent] -> unsqueeze dim=2 for broadcast
-        delta = student_means.unsqueeze(2) - teacher_means
+        # delta: [B, S', *latent]
+        delta = student_means_fp32 - teacher_means
 
         # Compute per-step KL
         if self.noise_level > 0.0:
@@ -430,9 +445,8 @@ class DiffusionOPD(StageAlgorithm):
             for step_idx in target_steps:
                 sv = _compute_std_var(sigmas, step_idx, eta)
                 std_vars.append(sv)
-            # std_vars: [S'] scalars -> broadcast to [1, S', 1, 1, 1, 1]
-            std_var_t = torch.stack(std_vars).to(student_means.device, student_means.dtype)
-            # Reshape for broadcasting: [S'] -> [1, S', 1, ...]
+            # std_vars: [S'] scalars -> broadcast to [1, S', 1, 1, 1]
+            std_var_t = torch.stack(std_vars).to(student_means.device, torch.float32)
             while std_var_t.dim() < delta.dim():
                 std_var_t = std_var_t.unsqueeze(-1)
             std_var_t = std_var_t.unsqueeze(0)  # [1, S', 1, ...]
@@ -442,12 +456,8 @@ class DiffusionOPD(StageAlgorithm):
             # ODE mode: mean-matching = 0.5 * delta²
             per_step_kl = 0.5 * (delta**2)
 
-        # Reduce: mean over latent dims, sum over teachers (K), mean over steps (S') and batch (B)
-        # [B, S', K, *latent] -> mean over latent dims -> [B, S', K]
-        per_step_kl_scalar = per_step_kl.mean(dim=tuple(range(3, per_step_kl.ndim)))
-        # Sum over teachers (K dim)
-        per_step_kl_per_sample = per_step_kl_scalar.sum(dim=2)  # [B, S']
-        # Mean over steps and batch
+        # Reduce: mean over latent dims → [B, S'], then mean over steps + batch.
+        per_step_kl_per_sample = per_step_kl.mean(dim=tuple(range(2, per_step_kl.ndim)))
         distill_loss = per_step_kl_per_sample.mean()
 
         loss = distill_loss
