@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -42,25 +41,99 @@ logger = logging.getLogger(__name__)
 # ── Constants ───────────────────────────────────────────────────────────────
 
 _COLORS: List[str] = [
-    "red", "orange", "yellow", "green", "blue",
-    "purple", "pink", "brown", "black", "white",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "purple",
+    "pink",
+    "brown",
+    "black",
+    "white",
 ]
 
 # COCO class names used by Mask2Former (indices match its output layout).
 _OBJECT_NAMES: List[str] = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
-    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-    "laptop", "computer mouse", "tv remote", "computer keyboard",
-    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
-    "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "computer mouse",
+    "tv remote",
+    "computer keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
     "toothbrush",
 ]
 
@@ -73,12 +146,12 @@ _DEFAULT_CKPT_URL = (
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+
 def _compute_iou(box_a, box_b) -> float:
     def _area(box):
         return max(box[2] - box[0] + 1, 0) * max(box[3] - box[1] + 1, 0)
 
-    i = _area([max(box_a[0], box_b[0]), max(box_a[1], box_b[1]),
-               min(box_a[2], box_b[2]), min(box_a[3], box_b[3])])
+    i = _area([max(box_a[0], box_b[0]), max(box_a[1], box_b[1]), min(box_a[2], box_b[2]), min(box_a[3], box_b[3])])
     u = _area(box_a) + _area(box_b) - i
     return i / u if u else 0.0
 
@@ -125,7 +198,7 @@ class _ImageCrops(torch.utils.data.Dataset):
 
 
 def _resolve_mmdet_config(explicit: str) -> str:
-    """Resolve the Mask2Former config path (mmdet 3.x layout).
+    """Resolve the Mask2Former config path for mmdet 2.x or 3.x.
 
     If ``explicit`` is a readable file, use it. Otherwise search a few known
     mmdet-shipped config filenames under ``<mmdet>/configs/mask2former/``
@@ -201,6 +274,7 @@ def _resolve_mmdet_ckpt(explicit: str) -> str:
 
 # ── Scorer ──────────────────────────────────────────────────────────────────
 
+
 class GenEvalRewardScorer(LocalRewardBackend):
     """Classical GenEval compositional reward: Mask2Former + CLIP color check.
 
@@ -225,26 +299,26 @@ class GenEvalRewardScorer(LocalRewardBackend):
         if self._score_type not in ("strict", "score"):
             raise ValueError(f"score_type must be 'strict' or 'score', got {self._score_type!r}")
 
-        super().__init__(device=resolve_device(config.device, base_device), batch_size=config.batch_size)
-
         self._object_detector: Any = None
         self._clip_model: Any = None
         self._clip_transform: Any = None
         self._clip_tokenizer: Any = None
         self._color_classifiers: Dict[str, Any] = {}
 
+        super().__init__(device=resolve_device(config.device, base_device), batch_size=config.batch_size)
+
     def _load_model(self) -> None:
         try:
-            from mmdet.apis import init_detector  # noqa: F401
             import open_clip  # noqa: F401
+            from mmdet.apis import init_detector  # noqa: F401
         except ImportError as e:
             raise ImportError(
                 "GenEvalRewardScorer requires mmdet, mmcv-full, open_clip_torch, and "
                 "clip_benchmark. Install in the launcher before handoff."
             ) from e
 
-        from mmdet.apis import init_detector
         import open_clip
+        from mmdet.apis import init_detector
 
         cfg = _resolve_mmdet_config(self._mmdet_config)
         ckpt = _resolve_mmdet_ckpt(self._mmdet_ckpt)
@@ -273,7 +347,7 @@ class GenEvalRewardScorer(LocalRewardBackend):
                 [
                     f"a photo of a {{c}} {classname}",
                     f"a photo of a {{c}}-colored {classname}",
-                    f"a photo of a {{c}} object",
+                    "a photo of a {c} object",
                 ],
                 str(self.device),
             )
@@ -366,26 +440,41 @@ class GenEvalRewardScorer(LocalRewardBackend):
     # -- Detection -----------------------------------------------------------
 
     def _detect_and_evaluate(self, image: Image.Image, metadata: dict) -> float:
-        """Run Mask2Former detection (mmdet 3.x API) and score against metadata.
+        """Run Mask2Former detection and score against metadata.
 
-        mmdet 3.x's ``inference_detector`` returns a ``DetDataSample`` with a
-        ``pred_instances`` structure holding tensors for bboxes / scores /
-        labels / (optional) masks — different from mmdet 2.x's
-        ``(bbox_list_per_class, segm_list_per_class)`` tuple. We re-bucket
-        instances by class label to keep the downstream evaluation logic (which
-        expects a ``{classname: [(box_with_score_as_5th_col, mask_or_None)]}``
-        dict) unchanged.
+        Supports both mmdet 2.x's per-class list/tuple result and mmdet 3.x's
+        ``DetDataSample.pred_instances``. Both are normalized to per-class
+        ``[x1, y1, x2, y2, score]`` arrays before confidence filtering and NMS.
         """
         from mmdet.apis import inference_detector
 
         result = inference_detector(self._object_detector, np.array(image))
-        pred = result.pred_instances
-        bboxes = pred.bboxes.detach().cpu().numpy()   # [N, 4] xyxy
-        scores = pred.scores.detach().cpu().numpy()   # [N]
-        labels = pred.labels.detach().cpu().numpy()   # [N]
-        masks = None
-        if hasattr(pred, "masks") and pred.masks is not None:
-            masks = pred.masks.detach().cpu().numpy() # [N, H, W] bool
+        if hasattr(result, "pred_instances"):
+            pred = result.pred_instances
+            bboxes = pred.bboxes.detach().cpu().numpy()  # [N, 4] xyxy
+            scores = pred.scores.detach().cpu().numpy()  # [N]
+            labels = pred.labels.detach().cpu().numpy()  # [N]
+            masks = None
+            if hasattr(pred, "masks") and pred.masks is not None:
+                masks = pred.masks.detach().cpu().numpy()  # [N, H, W] bool
+
+            bbox_by_class: List[np.ndarray] = []
+            segm_by_class: Optional[List[Any]] = [] if masks is not None else None
+            for cls_idx in range(len(_OBJECT_NAMES)):
+                cls_sel = np.where(labels == cls_idx)[0]
+                cls_boxes = bboxes[cls_sel]
+                cls_scores = scores[cls_sel]
+                bbox_by_class.append(np.concatenate([cls_boxes, cls_scores[:, None]], axis=1))
+                if segm_by_class is not None:
+                    segm_by_class.append(masks[cls_sel])
+        else:
+            # mmdet 2.x: bbox-only models return the per-class list directly;
+            # instance-segmentation models return ``(bbox, segm)``.
+            bbox_by_class = result[0] if isinstance(result, tuple) else result
+            segm_by_class = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            # Some mmdet 2.x models return ``(segms, mask_scores)`` here.
+            if isinstance(segm_by_class, tuple):
+                segm_by_class = segm_by_class[0]
 
         image = ImageOps.exif_transpose(image)
         tag = metadata.get("tag", "")
@@ -393,16 +482,13 @@ class GenEvalRewardScorer(LocalRewardBackend):
 
         detected: Dict[str, List[tuple]] = {}
         for cls_idx, classname in enumerate(_OBJECT_NAMES):
-            cls_sel = np.where(labels == cls_idx)[0]
-            if cls_sel.size == 0:
+            if cls_idx >= len(bbox_by_class):
                 continue
-            cls_boxes = bboxes[cls_sel]
-            cls_scores = scores[cls_sel]
-            cls_segms = masks[cls_sel] if masks is not None else None
-            # Append score as 5th col so downstream helpers (_compute_iou,
-            # _relative_position) that only touch box[:4] still work, and
-            # _evaluate_* that never read box[4] are unaffected.
-            cls_boxes5 = np.concatenate([cls_boxes, cls_scores[:, None]], axis=1)
+            cls_boxes5 = np.asarray(bbox_by_class[cls_idx])
+            if cls_boxes5.size == 0:
+                continue
+            cls_scores = cls_boxes5[:, 4]
+            cls_segms = segm_by_class[cls_idx] if segm_by_class is not None and cls_idx < len(segm_by_class) else None
 
             ordering = np.argsort(cls_scores)[::-1]
             ordering = ordering[cls_scores[ordering] > conf_thr]
@@ -410,12 +496,15 @@ class GenEvalRewardScorer(LocalRewardBackend):
             entries: List[tuple] = []
             while ordering:
                 max_obj = ordering.pop(0)
-                entries.append((
-                    cls_boxes5[max_obj],
-                    None if cls_segms is None else cls_segms[max_obj],
-                ))
+                entries.append(
+                    (
+                        cls_boxes5[max_obj],
+                        None if cls_segms is None else cls_segms[max_obj],
+                    )
+                )
                 ordering = [
-                    o for o in ordering
+                    o
+                    for o in ordering
                     if self._nms_threshold == 1.0
                     or _compute_iou(cls_boxes5[max_obj], cls_boxes5[o]) < self._nms_threshold
                 ]

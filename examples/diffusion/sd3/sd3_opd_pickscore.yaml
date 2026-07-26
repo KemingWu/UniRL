@@ -172,7 +172,7 @@ data_source:
     run:
       # Per-teacher datasets: each teacher slot only sees its own domain's
       # prompts, matching the original DiffusionOPD paper. The teachers list
-      # order MUST match the ``algorithm.teachers`` order below so that the
+      # order MUST match the ``algorithm.teachers`` order above so that the
       # algorithm's round-robin counter picks the same teacher as the batch.
       teachers:
         - name: pickscore

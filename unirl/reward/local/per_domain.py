@@ -17,8 +17,8 @@ classical GenEval wants ``include``/``exclude``), and a scorer can't score a
 batch outside its own domain. This scorer resolves both concerns:
 
 - One inner scorer per domain — each only sees the items it can score.
-- Per-domain wandb series via ``component_rewards`` (``reward_pickscore``,
-  ``reward_ocr``, ``reward_geneval``, …), so all three teachers' progress is
+- Per-domain wandb series via ``component_rewards`` (``pickscore``, ``ocr``,
+  ``geneval``, …), so all three teachers' progress is
   visible on separate curves.
 
 Reward is monitoring-only in OPD (the loss comes from teacher transition
@@ -83,7 +83,8 @@ class PerDomainRewardScorer(RewardBackend):
     ``metadata[i]["teacher_domain"]``) to a fully constructed
     :class:`RewardBackend` — Hydra builds each entry from its own
     ``_target_``. Items without a domain tag, or with a tag unmapped in
-    ``scorers``, produce ``0.0`` with a warning.
+    ``scorers``, are reported as failed so the outer reward service can stop
+    rather than silently train or monitor against the wrong scorer.
 
     Because DiffusionOPD's data source yields single-domain batches, the
     common case runs exactly one inner scorer per call. Mixed-domain
@@ -96,8 +97,7 @@ class PerDomainRewardScorer(RewardBackend):
         super().__init__(model_name="per_domain", batch_size=config.batch_size)
         if not config.scorers:
             raise ValueError(
-                "PerDomainRewardScorer requires a non-empty `scorers` dict "
-                "(domain -> RewardBackend instance)."
+                "PerDomainRewardScorer requires a non-empty `scorers` dict (domain -> RewardBackend instance)."
             )
         # Hydra has already recursively instantiated each entry to a real
         # RewardBackend (local or remote). We just hold the references.
@@ -125,7 +125,7 @@ class PerDomainRewardScorer(RewardBackend):
             total = torch.zeros(bs, dtype=torch.float32)
             component_rewards: Dict[str, List[float]] = {}
             for domain in self._scorers:
-                component_rewards[f"reward_{domain}"] = [float("nan")] * bs
+                component_rewards[domain] = [float("nan")] * bs
 
             errors: List[Optional[str]] = [None] * bs
             successes: List[bool] = [True] * bs
@@ -142,7 +142,7 @@ class PerDomainRewardScorer(RewardBackend):
                     )
                 for local_i, global_i in enumerate(indices):
                     total[global_i] = float(rewards[local_i])
-                    component_rewards[f"reward_{domain}"][global_i] = float(rewards[local_i])
+                    component_rewards[domain][global_i] = float(rewards[local_i])
                 # Propagate per-item success/error signals if inner provided them.
                 inner_succ = getattr(resp, "successes", None)
                 inner_err = getattr(resp, "errors", None)

@@ -66,9 +66,7 @@ class MultiTeacherRLDataSource:
         for t in teachers:
             name = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
             data_path = t.get("data_path") if isinstance(t, dict) else getattr(t, "data_path", None)
-            eval_data_path = (
-                t.get("eval_data_path") if isinstance(t, dict) else getattr(t, "eval_data_path", None)
-            )
+            eval_data_path = t.get("eval_data_path") if isinstance(t, dict) else getattr(t, "eval_data_path", None)
             if not name or not data_path:
                 raise ValueError(
                     f"Each teacher entry must define 'name' and 'data_path' (got {dict(t) if hasattr(t, 'items') else t!r})."
@@ -78,7 +76,11 @@ class MultiTeacherRLDataSource:
             if eval_data_path and not os.path.exists(eval_data_path):
                 raise FileNotFoundError(f"Teacher '{name}' eval_data_path not found: {eval_data_path}")
             self.teachers.append(
-                {"name": str(name), "data_path": str(data_path), "eval_data_path": str(eval_data_path) if eval_data_path else None}
+                {
+                    "name": str(name),
+                    "data_path": str(data_path),
+                    "eval_data_path": str(eval_data_path) if eval_data_path else None,
+                }
             )
 
         # Duplicate name detection: algorithm side keys teachers by name.
@@ -203,9 +205,7 @@ class MultiTeacherRLDataSource:
             self._eval_datasets.append(ds)
         self._eval_ready = True
 
-    def _example_to_batch(
-        self, prompt_examples: List[Dict[str, Any]], teacher_name: str
-    ) -> RolloutInputs:
+    def _example_to_batch(self, prompt_examples: List[Dict[str, Any]], teacher_name: str) -> RolloutInputs:
         prompts = [ex["prompt"] for ex in prompt_examples]
         prompt_ids = [str(ex.get("prompt_id") or f"eval:{teacher_name}:{i}") for i, ex in enumerate(prompt_examples)]
         sample_ids = [f"prompt:{pid}:sample:0" for pid in prompt_ids]
@@ -234,17 +234,20 @@ class MultiTeacherRLDataSource:
             return
         self._ensure_eval_datasets()
 
-        # Split eval budget evenly across teachers; ``-1`` means "full set per
-        # teacher". This mirrors the paper's eval-per-teacher semantics.
-        per_teacher_limit = eval_num_prompts if eval_num_prompts < 0 else max(
-            1, eval_num_prompts // len(self.teachers)
-        )
+        # Split the global eval budget evenly across teachers; ``-1`` means
+        # "full set per teacher". Give any remainder to the first teachers so
+        # the finite case never exceeds ``eval_num_prompts``.
+        if eval_num_prompts < 0:
+            teacher_limits = [-1] * len(self.teachers)
+        else:
+            per_teacher, remainder = divmod(eval_num_prompts, len(self.teachers))
+            teacher_limits = [per_teacher + int(i < remainder) for i in range(len(self.teachers))]
 
-        for tc, ds in zip(self.teachers, self._eval_datasets):
-            if ds is None:
+        for tc, ds, teacher_limit in zip(self.teachers, self._eval_datasets, teacher_limits):
+            if ds is None or teacher_limit == 0:
                 continue
             total = len(ds)
-            limit = total if per_teacher_limit < 0 else min(per_teacher_limit, total)
+            limit = total if teacher_limit < 0 else min(teacher_limit, total)
             for start in range(0, limit, batch_size):
                 end = min(start + batch_size, limit)
                 prompt_examples = [

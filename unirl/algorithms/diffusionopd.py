@@ -72,7 +72,7 @@ def _compute_std_var(sigmas: torch.Tensor, step_idx: int, eta: float) -> torch.T
     sigma_next = sigmas[step_idx + 1].float()
     dt = sigma_next - sigma
     sigma_max = float(sigmas[1].item()) if sigmas.shape[0] > 1 else 0.99
-    sigma_clamped = torch.where(sigma == 1.0, torch.tensor(sigma_max), sigma)
+    sigma_clamped = torch.where(sigma == 1.0, sigma.new_tensor(sigma_max), sigma)
     std_dev_t = torch.sqrt(sigma / (1.0 - sigma_clamped)) * eta
     std_var = std_dev_t * torch.sqrt(-dt)
     return std_var
@@ -102,6 +102,7 @@ class DiffusionOPD(StageAlgorithm):
     requires_ema_rollout = False
     supports_multi_update = False
     requires_backend = True
+    requires_advantages = False
     anchor_fields = ()
 
     def __init__(
@@ -159,8 +160,6 @@ class DiffusionOPD(StageAlgorithm):
         # happens later in the FSDPBackend lifecycle).
         self._teachers_loaded = False
 
-        # Per-rollout teacher means storage (set in prepare_segment).
-        self._teacher_means: Optional[torch.Tensor] = None
         # Round-robin counter: cycles through teachers across rollouts.
         self._rollout_counter: int = 0
 
@@ -186,9 +185,7 @@ class DiffusionOPD(StageAlgorithm):
 
             # Check if adapter already injected (idempotent).
             has_adapter = any(
-                adapter_name in getattr(m, "lora_A", {})
-                for m in model.modules()
-                if isinstance(m, LoraLayer)
+                adapter_name in getattr(m, "lora_A", {}) for m in model.modules() if isinstance(m, LoraLayer)
             )
             if has_adapter:
                 continue
@@ -331,8 +328,8 @@ class DiffusionOPD(StageAlgorithm):
             self._teachers_loaded = True
 
         sde_indices = segment.sde_indices
-        if sde_indices is None:
-            self._teacher_means = None
+        if sde_indices is None or sde_indices.numel() == 0:
+            segment.sde_means = None
             return
         target_steps = sde_indices.tolist()
 
@@ -361,8 +358,10 @@ class DiffusionOPD(StageAlgorithm):
 
         if result.prev_sample_means is not None:
             # Shape: [B, S', *latent] — DiffusionOPD is per-batch one-teacher
-            # (round-robin), so there is no multi-teacher K dim to carry.
-            self._teacher_means = result.prev_sample_means.detach()
+            # (round-robin), so there is no multi-teacher K dim to carry. Keep
+            # the means on the segment: TrainStack slices CONCAT fields with
+            # each micro-batch, preserving batch alignment during replay.
+            segment.sde_means = result.prev_sample_means.detach().cpu()
             # Debug: verify teacher adapter actually changed the output.
             # Do a quick student replay to compare.
             with torch.no_grad():
@@ -389,7 +388,7 @@ class DiffusionOPD(StageAlgorithm):
                 "OPD requires the stage's replay to produce means.",
                 tc["name"],
             )
-            self._teacher_means = None
+            segment.sde_means = None
 
     def compute_loss_and_backward(
         self,
@@ -405,12 +404,12 @@ class DiffusionOPD(StageAlgorithm):
         OPD does NOT use ``advantages`` — supervision is purely from the teacher
         transition means stored in ``prepare_segment``.
         """
-        if self._teacher_means is None:
+        if segment.sde_means is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         sde_indices = segment.sde_indices
-        if sde_indices is None:
+        if sde_indices is None or sde_indices.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         target_steps = sde_indices.tolist()
 
@@ -430,7 +429,7 @@ class DiffusionOPD(StageAlgorithm):
         # fast (the KL is a per-pixel MSE reduced over ~65k elements). Flow-
         # Factory does the same (trainers/opd/trainer.py:339).
         student_means_fp32 = student_means.float()
-        teacher_means = self._teacher_means.to(device=student_means.device, dtype=torch.float32)
+        teacher_means = segment.sde_means.to(device=student_means.device, dtype=torch.float32)
 
         # delta: [B, S', *latent]
         delta = student_means_fp32 - teacher_means
@@ -445,11 +444,11 @@ class DiffusionOPD(StageAlgorithm):
             for step_idx in target_steps:
                 sv = _compute_std_var(sigmas, step_idx, eta)
                 std_vars.append(sv)
-            # std_vars: [S'] scalars -> broadcast to [1, S', 1, 1, 1]
+            # std_vars: [S'] scalars -> broadcast to [1, S', 1, ...]
             std_var_t = torch.stack(std_vars).to(student_means.device, torch.float32)
+            std_var_t = std_var_t.unsqueeze(0)
             while std_var_t.dim() < delta.dim():
                 std_var_t = std_var_t.unsqueeze(-1)
-            std_var_t = std_var_t.unsqueeze(0)  # [1, S', 1, ...]
             sigma_sq = (std_var_t**2).clamp(min=1e-8)
             per_step_kl = (delta**2) / (2.0 * sigma_sq)
         else:
