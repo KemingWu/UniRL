@@ -1,9 +1,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 LoraModuleSelection = Union[str, Tuple[str, ...]]
+
+
+@dataclass
+class FrozenAdapterSpec:
+    """A frozen, inference-only LoRA adapter loaded at build time.
+
+    ``name`` is the peft adapter name (algorithms address it by this name,
+    e.g. DiffusionOPD teachers); ``path`` is a local peft checkpoint dir or an
+    HF repo id (``org/repo`` / ``org/repo/subfolder``). Geometry (rank / alpha /
+    target_modules) comes from the checkpoint's own ``adapter_config.json``.
+    """
+
+    name: str = ""
+    path: str = ""
+
+
+def normalize_frozen_adapters(specs: Any) -> List[FrozenAdapterSpec]:
+    """Validate ``LoraConfig.frozen_adapters`` entries into typed specs.
+
+    Accepts ``None`` (→ ``[]``) or a sequence of ``FrozenAdapterSpec`` /
+    mappings / attribute objects carrying ``name`` + ``path``. Names must be
+    non-empty, unique, and must not shadow the trainable ``"default"`` adapter.
+    """
+    if not specs:
+        return []
+    normalized: List[FrozenAdapterSpec] = []
+    for entry in specs:
+        if isinstance(entry, FrozenAdapterSpec):
+            name, path = entry.name, entry.path
+        elif hasattr(entry, "get"):
+            name, path = entry.get("name"), entry.get("path")
+        else:
+            name, path = getattr(entry, "name", None), getattr(entry, "path", None)
+        if not name or not path:
+            raise ValueError(f"frozen_adapters entries need non-empty 'name' and 'path'; got {entry!r}.")
+        if str(name) == "default":
+            raise ValueError("frozen_adapters: 'default' is the trainable adapter and cannot be frozen.")
+        normalized.append(FrozenAdapterSpec(name=str(name), path=str(path)))
+    names = [s.name for s in normalized]
+    if len(set(names)) != len(names):
+        raise ValueError(f"frozen_adapters names must be unique, got {names}.")
+    return normalized
 
 
 @dataclass
@@ -25,6 +67,13 @@ class LoraConfig:
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
+    # Additional frozen, inference-only adapters injected next to the trainable
+    # ``default`` (e.g. DiffusionOPD teachers). Entries carry ``name`` + ``path``
+    # (see :class:`FrozenAdapterSpec`; plain dicts are accepted — ``Any`` for the
+    # same OmegaConf 2.3 reason as ``target_modules``). Sound only on this
+    # plain-LoRA path: the base weights stay frozen, so a teacher's deltas keep
+    # referring to the weights it was trained against.
+    frozen_adapters: Any = None
 
 
 @dataclass
