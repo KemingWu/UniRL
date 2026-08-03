@@ -168,6 +168,10 @@ class TrainStack(Remote):
         # checked once here at construction.
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
+        # Whether any rollout since the last ``zero_grad=True`` call reported a
+        # backward — the optimizer-step decision under cross-rollout gradient
+        # accumulation (``train_track(..., do_optimizer_step=False)`` windows).
+        self._accum_has_backward = False
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop.
@@ -220,12 +224,19 @@ class TrainStack(Remote):
         *,
         micros: UpdatePlan,
         training_progress: float,
+        zero_grad: bool = True,
+        do_optimizer_step: bool = True,
+        loss_weight: float = 1.0,
     ) -> TrainStepResult:
         """Run one optimizer step over the contiguous micro ranges of a single update.
 
         ``micros`` is one update's worth of ``(start, end)`` ranges produced by
         :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
         geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
+
+        ``zero_grad`` / ``do_optimizer_step`` / ``loss_weight`` implement
+        cross-rollout gradient accumulation (see :meth:`train_track`); the
+        defaults are the plain one-step-per-call contract.
         """
         if part.advantages is None and getattr(self.algorithm, "requires_advantages", True):
             raise ValueError(
@@ -237,7 +248,9 @@ class TrainStack(Remote):
             raise ValueError(f"{type(self).__name__}._run_update: empty micros.")
 
         bs = int(part.batch_size)
-        self.fsdp_backend.zero_grad()
+        if zero_grad:
+            self.fsdp_backend.zero_grad()
+            self._accum_has_backward = False
 
         loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros)
         micro_results: List[AlgorithmStepResult] = []
@@ -248,17 +261,22 @@ class TrainStack(Remote):
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
         last_micro = len(micros) - 1
         for i, (start, end) in enumerate(micros):
-            # Defer the per-block gradient reduce-scatter to the last micro-batch so
-            # it runs once per optimizer step instead of once per micro-batch (no-op
-            # unless defer_grad_sync + ZeRO-2). Must precede the backward.
-            self.fsdp_backend.set_grad_sync(i == last_micro)
+            # Defer the per-block gradient reduce-scatter to the last micro-batch
+            # BEFORE the optimizer step — under cross-rollout accumulation that is
+            # the stepping rollout's last micro, so mid-window backwards keep
+            # accumulating unsynced (no-op unless defer_grad_sync + ZeRO-2). Must
+            # precede the backward.
+            self.fsdp_backend.set_grad_sync(do_optimizer_step and i == last_micro)
             micro_part = part if single_micro else part.slice(start, end)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_part.conditions,
                 segment=micro_part.segment,
                 advantages=micro_part.advantages,
                 training_progress=training_progress,
-                loss_scale=loss_scales[i],
+                # ``loss_weight`` (1/M under accumulation) scales ONLY the backward;
+                # ``result.loss`` stays the raw micro mean, so logged losses remain
+                # comparable across accumulation settings.
+                loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
             if global_weight is None:
@@ -281,15 +299,26 @@ class TrainStack(Remote):
         # and the stale unsharded accumulation (which zero_grad cannot reach) would
         # leak into the NEXT step's reduce-scatter. Fail fast instead — mirrors
         # fsdp_wrap's stray-trainable guard.
-        if has_backward and not micro_results[-1].has_backward and self.fsdp_backend.grad_sync_deferred:
+        self._accum_has_backward = self._accum_has_backward or has_backward
+        if (
+            do_optimizer_step
+            and self._accum_has_backward
+            and not micro_results[-1].has_backward
+            and self.fsdp_backend.grad_sync_deferred
+        ):
             raise RuntimeError(
                 f"{type(self).__name__}._run_update: defer_grad_sync deferred the gradient "
-                "reduce-scatter to the last micro-batch, but it reported no backward (all-empty "
-                "micro?) while earlier micro-batches did — the accumulated grads were never "
-                "synced. Disable training.fsdp.defer_grad_sync or investigate the empty micro-batch."
+                "reduce-scatter to the stepping backward, but the last micro-batch before the "
+                "optimizer step reported no backward (all-empty micro?) while earlier backwards "
+                "ran — the accumulated grads were never synced. Disable "
+                "training.fsdp.defer_grad_sync or investigate the empty micro-batch."
             )
 
-        if has_backward:
+        if not do_optimizer_step:
+            # Accumulation-only rollout: gradients stay on the params; a later
+            # rollout in this accumulation window performs the optimizer step.
+            grad_norm = 0.0
+        elif self._accum_has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
         else:
             grad_norm = 0.0
@@ -471,8 +500,19 @@ class TrainStack(Remote):
         part: Part,
         *,
         training_progress: float,
+        zero_grad: bool = True,
+        do_optimizer_step: bool = True,
+        loss_weight: float = 1.0,
     ) -> TrainStepResult:
         """Driver-callable: arrange → prepare → run updates (×N) → on_rollout_end.
+
+        ``zero_grad`` / ``do_optimizer_step`` / ``loss_weight`` implement
+        cross-rollout gradient accumulation (the MOPD task-cycle contract): the
+        driver zeroes on the window's first rollout, backwards every rollout at
+        ``loss_weight = 1/M``, and steps only on the window's last — so the single
+        optimizer step sees the mean gradient of all M rollouts, computed at the
+        SAME (never-stepped) student weights. Defaults are the plain
+        one-step-per-rollout contract, bit-for-bit.
 
         Combines the steps so worker-side mutations (``segment.sde_logp`` populated
         by ``prepare_segment``) flow into the subsequent update(s) without
@@ -507,7 +547,14 @@ class TrainStack(Remote):
             self.prepare_segment(part, plans=plans)
             part = self.algorithm.prepare_part(part)
             self.fsdp_backend.model.train()
-            result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
+            result = self._run_updates(
+                part,
+                plans=plans,
+                training_progress=float(training_progress),
+                zero_grad=zero_grad,
+                do_optimizer_step=do_optimizer_step,
+                loss_weight=float(loss_weight),
+            )
         if profiler is not None:
             profiler.step()
         self.on_rollout_end()
@@ -529,6 +576,9 @@ class TrainStack(Remote):
         *,
         plans: Plan,
         training_progress: float,
+        zero_grad: bool = True,
+        do_optimizer_step: bool = True,
+        loss_weight: float = 1.0,
     ) -> TrainStepResult:
         """Run ``num_updates_per_batch`` optimizer steps over disjoint updates.
 
@@ -547,6 +597,13 @@ class TrainStack(Remote):
         # (forward + backward + cross-GPU comm + optimizer) — the compute/comm overlap window.
         from unirl.utils.profiling import maybe_profile_update, profile_scope
 
+        if len(plans) > 1 and (not zero_grad or not do_optimizer_step or loss_weight != 1.0):
+            raise ValueError(
+                f"{type(self).__name__}._run_updates: cross-rollout gradient accumulation "
+                "(zero_grad=False / do_optimizer_step=False / loss_weight != 1) requires "
+                "num_updates_per_batch == 1 — multiple optimizer steps inside one accumulation "
+                "window would re-step on partially accumulated gradients."
+            )
         scope_update = profile_scope() == "one-update"
         results = []
         for micros in plans:
@@ -556,7 +613,16 @@ class TrainStack(Remote):
                 else nullcontext()
             )
             with cm:
-                results.append(self._run_update(part, micros=micros, training_progress=training_progress))
+                results.append(
+                    self._run_update(
+                        part,
+                        micros=micros,
+                        training_progress=training_progress,
+                        zero_grad=zero_grad,
+                        do_optimizer_step=do_optimizer_step,
+                        loss_weight=loss_weight,
+                    )
+                )
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)

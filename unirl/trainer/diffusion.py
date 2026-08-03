@@ -39,7 +39,7 @@ class DiffusionTrainer(BaseTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -51,6 +51,7 @@ class DiffusionTrainer(BaseTrainer):
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
         adv_use_global_std: bool = False,
+        accumulate_rollouts: int = 1,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
@@ -137,6 +138,9 @@ class DiffusionTrainer(BaseTrainer):
 
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
+        # Stays None when the recipe has no ``reward:`` block — allowed only for
+        # requires_advantages=False algorithms (validated after construction below).
+        self.reward = None
 
         # Reward placement, orthogonal to the rollout ``layout`` below.
         # ``reward_fraction > 0`` carves reward its OWN disjoint slab of that
@@ -159,6 +163,11 @@ class DiffusionTrainer(BaseTrainer):
                 f"+ reward_fraction ({reward_fraction}) must be < 1.0"
             )
         reward_separate = reward_fraction > 0.0
+        if reward_separate and reward_cfg is None:
+            raise ValueError(
+                f"reward_fraction={reward_fraction} carves reward its own slab, but the recipe "
+                "has no `reward:` block — drop reward_fraction or configure a reward."
+            )
 
         # Construction (_build_train_side / _build_rollout) is shared; only the
         # placement topology and the train→rollout sync wiring differ per layout.
@@ -205,17 +214,68 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward = remote_hydra(reward_cfg)
                 self._wire_eval_suites()
 
+        # A missing ``reward:`` block is legal ONLY for supervised / teacher-anchored
+        # algorithms (requires_advantages=False, e.g. DiffusionOPD) — their loss never
+        # consumes rewards, so scoring becomes an optional monitoring overlay. RL
+        # algorithms hard-require a reward; eval needs one to score generations.
+        # Fail at construction with the knob named, not deep inside train_step.
+        if self.reward is None:
+            if self._algo_requires_advantages:
+                raise ValueError(
+                    "The recipe has no `reward:` block, but the algorithm requires advantages "
+                    "(requires_advantages=True) — RL training cannot run without a reward model. "
+                    "Only supervised/teacher-anchored algorithms may omit `reward:`."
+                )
+            if self.eval_interval > 0:
+                raise ValueError(
+                    f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
+                    "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                    "(monitoring-only) reward."
+                )
+
+        # Cross-rollout gradient accumulation (``accumulate_rollouts: M``): rollouts
+        # r with r % M != M-1 backward WITHOUT stepping; the M-th rollout performs one
+        # optimizer step over the mean of the M rollout gradients. This is the MOPD
+        # task-cycle contract (DiffusionOPD official config sets
+        # gradient_accumulation_steps = num_batches_per_epoch = len(teachers)).
+        self.accumulate_rollouts = int(accumulate_rollouts)
+        if self.accumulate_rollouts < 1:
+            raise ValueError(f"accumulate_rollouts must be >= 1, got {accumulate_rollouts}")
+        if self.accumulate_rollouts > 1:
+            n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
+            if n_updates != 1:
+                raise ValueError(
+                    f"accumulate_rollouts={self.accumulate_rollouts} requires "
+                    f"stack.num_updates_per_batch == 1 (got {n_updates}): multiple optimizer steps "
+                    "inside one accumulation window would re-step on partially accumulated gradients."
+                )
+            if self._uses_ema:
+                raise ValueError(
+                    f"accumulate_rollouts={self.accumulate_rollouts} is not validated with "
+                    "requires_ema_rollout algorithms (EMA updates fire per rollout boundary, "
+                    "not per optimizer step)."
+                )
+            domains = getattr(self.data_source, "domains", None)
+            if domains and self.accumulate_rollouts % len(domains) != 0:
+                raise ValueError(
+                    f"accumulate_rollouts={self.accumulate_rollouts} must be a multiple of the "
+                    f"data source's domain count ({len(domains)}), or each optimizer step would "
+                    "cover an uneven subset of the task cycle (mirrors the official DiffusionOPD "
+                    "assert on num_batches_per_epoch % len(teachers))."
+                )
+
         # Pre-flight for the reward_fraction footgun: when reward takes its own
         # slab the policy/rollout DP is the REDUCED card count, and the per-rollout
         # sample count must divide BOTH the rollout DP and the reward DP — else the
         # DP_SCATTER fails deep in generate()/score_and_attach with an opaque "not
         # divisible by dp_size" error. Fail early here, naming the knob.
         n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
-        if n_samples % self.rollout.dp_size or n_samples % self.reward.dp_size:
+        reward_dp = self.reward.dp_size if self.reward is not None else 1
+        if n_samples % self.rollout.dp_size or n_samples % reward_dp:
             raise ValueError(
                 f"batch_size({batch_size}) * samples_per_prompt = {n_samples} samples/rollout must be "
                 f"divisible by BOTH rollout dp_size={self.rollout.dp_size} and reward dp_size="
-                f"{self.reward.dp_size}. reward_fraction={reward_fraction} placed reward on its own slab, "
+                f"{reward_dp}. reward_fraction={reward_fraction} placed reward on its own slab, "
                 f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
                 f"samples_per_prompt divisible by both."
             )
@@ -504,8 +564,11 @@ class DiffusionTrainer(BaseTrainer):
             self.backend.onload()
 
         # Score the frontier gen Part (Sample -> Sample; the reward service is
-        # migrated alongside on its own branch — see the LIN-480 plan).
-        sample = self.reward.score_and_attach(sample)
+        # migrated alongside on its own branch — see the LIN-480 plan). With no
+        # reward configured (requires_advantages=False algorithms) scoring is
+        # skipped entirely — ``part.rewards`` stays None and the block below no-ops.
+        if self.reward is not None:
+            sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -533,7 +596,18 @@ class DiffusionTrainer(BaseTrainer):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._drop_decoded(sample, rollout_id=rollout_id)
-        result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
+        # Accumulation phase from the ABSOLUTE rollout_id, so checkpoint resume
+        # re-enters the cycle at the right phase with no extra state. With
+        # accumulate_rollouts=1 the flags are (True, True, 1.0) — the plain
+        # one-step-per-rollout contract, bit-for-bit.
+        acc = self.accumulate_rollouts
+        result = self.stack.train_track(
+            sample.parts[-1],
+            training_progress=float(training_progress),
+            zero_grad=(rollout_id % acc == 0),
+            do_optimizer_step=((rollout_id + 1) % acc == 0),
+            loss_weight=1.0 / acc,
+        )
         self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
@@ -562,6 +636,14 @@ class DiffusionTrainer(BaseTrainer):
         evaluation does not perturb its pipeline. The defaults preserve the
         synchronous trainer's existing behavior.
         """
+        if self.reward is None:
+            # Unreachable via train() (construction rejects eval_interval>0 with no
+            # reward); guards direct calls with a named cause instead of an
+            # AttributeError deep in the scorer loop.
+            raise RuntimeError(
+                "DiffusionTrainer.evaluate: no reward configured (the recipe has no `reward:` "
+                "block) — evaluation scores generations and needs one."
+            )
         # Override only the "diffusion" entry of the modality-keyed sampling dict
         # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
         # on Bagel's sampling params; for the standard DiffusionSamplingParams

@@ -24,6 +24,13 @@
 num_devices: 8
 batch_size: 8
 num_rollouts: 10000
+# MOPD task-cycle accumulation: one optimizer step per FULL teacher cycle
+# (pickscore + ocr + geneval backwards averaged at 1/3 each, single step) —
+# the official DiffusionOPD config sets gradient_accumulation_steps =
+# num_batches_per_epoch = len(teachers). Must be a multiple of the domain
+# count. Effective optimizer steps = num_rollouts / accumulate_rollouts; the
+# wandb train/step axis keeps counting rollouts.
+accumulate_rollouts: 3
 
 logging:
   report_to_wandb: true
@@ -113,6 +120,9 @@ rollout:
 # Reward is MONITORING-ONLY for OPD (the loss is teacher-driven; the algorithm
 # declares requires_advantages=false, so the trainer skips advantage
 # derivation). Per-domain routing keys off metadata["domain"].
+# OPTIONAL: delete this whole ``reward:`` block to train with no reward model
+# at all (no per-domain wandb curves, and eval_interval must then be 0) — e.g.
+# when the GenEval sidecar service is unavailable.
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
@@ -184,6 +194,9 @@ data_source:
       # One prompt set per teacher domain; batches cycle pickscore -> ocr ->
       # geneval and each batch is single-domain (metadata["domain"] carries the
       # routing — nothing depends on this list's order matching the algorithm).
+      # The ocr/geneval prompt sets ship in-repo (imported from X-GenGroup/
+      # Flow-Factory dataset/, Apache-2.0; geneval include/exclude normalized
+      # from JSON-encoded strings to real JSON values).
       domains:
         - name: pickscore
           data_path: datasets/pickscore/train.txt
@@ -192,8 +205,8 @@ data_source:
           data_path: datasets/ocr/train.txt
           eval_data_path: datasets/ocr/test.txt
         - name: geneval
-          data_path: datasets/geneval/train_metadata.jsonl
-          eval_data_path: datasets/geneval/test_metadata.jsonl
+          data_path: datasets/geneval/train.jsonl
+          eval_data_path: datasets/geneval/test.jsonl
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}
