@@ -23,7 +23,10 @@
 
 num_devices: 8
 batch_size: 8
-num_rollouts: 10000
+# Must be a multiple of accumulate_rollouts (the trainer fail-fasts otherwise):
+# run/save/resume boundaries have to land on full task-cycle windows because
+# accumulated gradients are not part of checkpoints.
+num_rollouts: 9999
 # MOPD task-cycle accumulation: one optimizer step per FULL teacher cycle
 # (pickscore + ocr + geneval backwards averaged at 1/3 each, single step) —
 # the official DiffusionOPD config sets gradient_accumulation_steps =

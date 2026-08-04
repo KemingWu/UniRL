@@ -749,6 +749,30 @@ class DiffusionTrainer(BaseTrainer):
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
+        # Accumulated gradients live only on the params (.grad) — checkpoints do
+        # not carry them. Any run/save/resume boundary that lands mid-window
+        # would silently drop the domains already backwarded in that window, so
+        # every boundary must sit on a full accumulation window.
+        acc = self.accumulate_rollouts
+        if acc > 1:
+            if num_rollouts % acc:
+                raise ValueError(
+                    f"num_rollouts={num_rollouts} is not a multiple of accumulate_rollouts={acc}: "
+                    "the final window would backward without ever stepping, and the final "
+                    "checkpoint would land mid-window."
+                )
+            if save_interval > 0 and save_interval % acc:
+                raise ValueError(
+                    f"save_interval={save_interval} is not a multiple of accumulate_rollouts={acc}: "
+                    "a mid-window checkpoint cannot carry the window's accumulated gradients, so "
+                    "resuming from it would step on a partial task cycle."
+                )
+            if start_rollout % acc:
+                raise ValueError(
+                    f"resume checkpoint is at rollout {start_rollout}, mid-window for "
+                    f"accumulate_rollouts={acc}: the gradients accumulated before the save were "
+                    "not (and cannot be) restored. Resume from a window-boundary checkpoint."
+                )
         # Fast-forward the data stream to the resume point — exact when
         # run.seed is set (deterministic shuffle); with seed=null the stream
         # is non-reproducible anyway.
