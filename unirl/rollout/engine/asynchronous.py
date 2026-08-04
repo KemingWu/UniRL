@@ -54,11 +54,6 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
-# Mechanisms
-# ---------------------------------------------------------------------------
-
-
 class VersionedBuffer(Generic[T]):
     """Payload-agnostic freshness buffer of ``(payload, weight_version, gen_id)`` items.
 
@@ -111,7 +106,6 @@ class VersionedBuffer(Generic[T]):
         return evicted
 
 
-#: Reap-time completion hook: ``(gen_id, weight_version, completed_payload)``.
 Complete = Callable[[int, int, Any], None]
 
 
@@ -119,7 +113,7 @@ Complete = Callable[[int, int, Any], None]
 class _InflightJob:
     gen_id: int
     weight_version: int
-    pending: Any  # PendingHandleCall
+    pending: Any
 
 
 class InflightPool:
@@ -206,11 +200,6 @@ class InflightPool:
             self._jobs[0].pending.wait()
 
 
-# ---------------------------------------------------------------------------
-# Batch engine
-# ---------------------------------------------------------------------------
-
-
 class AsyncBatchRolloutEngine:
     """Batch-granular async engine over a ``SyncRolloutEngine`` slab Handle; buffers ``Sample`` groups.
 
@@ -279,11 +268,6 @@ class AsyncBatchRolloutEngine:
             self._buffer.put(group, weight_version=weight_version, gen_id=gen_id)
 
 
-# ---------------------------------------------------------------------------
-# Agentic engine (driver-side facade over the rank-0 coordinator)
-# ---------------------------------------------------------------------------
-
-
 def root_of(traj: "Sample") -> str:
     """Root id shared by a prompt's ``n`` sibling trajectories."""
     return traj.parts[0].sample_ids[0]
@@ -346,6 +330,7 @@ class AsyncAgenticRolloutEngine:
         self._buffer: VersionedBuffer[List["Sample"]] = VersionedBuffer()
         self._gen_id = int(start_gen_id)
         self._weight_version = 0
+        self._drive_live = False
 
     @property
     def weight_version(self) -> int:
@@ -356,7 +341,21 @@ class AsyncAgenticRolloutEngine:
         return self._weight_version
 
     def submit(self, tasks: List["Sample"]) -> None:
-        """Fire a background drive over a flat task list (fresh siblings + carried partials)."""
+        """Fire a background drive over a flat task list (fresh siblings + carried partials).
+
+        Enforced double-pull guard: two live drains would double-pull the
+        coordinator queue, so a second ``submit`` before ``finalize_if_drained``
+        reported the drive done (or before ``quiesce``) raises instead of
+        silently corrupting the drive.
+        """
+        if self._drive_live:
+            raise RuntimeError(
+                "AsyncAgenticRolloutEngine.submit: prior drive still live — wait for "
+                "finalize_if_drained() to report it done or quiesce() first (a second "
+                "drain would double-pull the coordinator queue)."
+            )
+        # Set before RPC so ambiguous submit failures remain guarded.
+        self._drive_live = True
         self._rollout.submit(tasks)
 
     def poll(self) -> int:
@@ -369,6 +368,7 @@ class AsyncAgenticRolloutEngine:
         completed = self._rollout.finalize_if_drained()[0]
         if completed is None:
             return None
+        self._drive_live = False
         return self._ingest(completed)
 
     def drain_freshest(self, n: int, *, max_staleness: int) -> Optional[List[List["Sample"]]]:
@@ -384,6 +384,7 @@ class AsyncAgenticRolloutEngine:
         version they completed under."""
         carried = self._rollout.abort()[0]
         self.poll()
+        self._drive_live = False
         return carried
 
     def discard_roots(self, roots: Iterable[str]) -> int:
@@ -406,8 +407,27 @@ class AsyncAgenticRolloutEngine:
         return len(completed)
 
 
+def launch_ceiling(rollout_id: int, *, sync_interval: int, max_staleness: int, num_rollouts: int) -> int:
+    """The batch trainers' on-policy launch clamp — trainer POLICY, defined once.
+
+    A generation launched now is consumed later, so how far ahead the gen_id
+    allocator may run is bounded to ``max_staleness`` weight-sync windows:
+    ``max_staleness=0`` ⇒ never launch into a future sync-window ⇒ no
+    generation crosses a sync ⇒ ``ratio≈1`` (on-policy).
+
+    OWNERSHIP: this is trainer-side POLICY, not engine surface — its vocabulary
+    (``rollout_id`` / ``sync_interval`` / ``num_rollouts``) is the trainers',
+    the engine classes never call it, and it must never become an engine
+    method. It is hosted in this module only because it is the two batch
+    trainers' one shared torch-free home; the step loops that use it stay in
+    the trainers as visible statement order.
+    """
+    return min(num_rollouts, ((rollout_id // sync_interval) + 1 + max_staleness) * sync_interval)
+
+
 __all__ = [
     "AsyncAgenticRolloutEngine",
     "AsyncBatchRolloutEngine",
+    "launch_ceiling",
     "root_of",
 ]
