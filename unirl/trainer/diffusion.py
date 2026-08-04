@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -11,12 +11,14 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
+from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,12 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError(
                 f"accumulate_rollouts={acc} is not validated with requires_ema_rollout "
                 "algorithms (EMA updates fire per rollout boundary, not per optimizer step)."
+            )
+        if self.pool.transport_kind in ("transfer_queue", "tq"):
+            raise ValueError(
+                f"accumulate_rollouts={acc} is not validated with the transfer_queue transport: "
+                "buffers are reclaimed once per window (after train_step), so the pool would "
+                "have to hold every rollout of the window."
             )
         if self.eval_interval > 0 and self.eval_interval % acc:
             raise ValueError(
@@ -446,6 +454,48 @@ class DiffusionTrainer(BaseTrainer):
         self._drop_decoded(sample, rollout_id=rollout_id)
         return sample, mean_reward
 
+    def train_step(
+        self,
+        window_ids: Sequence[int],
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        force_sync_at: Optional[int] = None,
+    ) -> Tuple[TrainStepResult, float]:
+        """One accumulation window: rollouts → one optimizer step → one log point.
+
+        The NAME is a framework seam — :class:`BaseTrainer` wraps ``train_step``
+        for transfer-queue buffer reclamation and ``install_phase_timing`` for
+        ``perf/*`` attribution. The reclaim fires when this returns: after the
+        window has trained, the only point with no live ``TensorRef`` into the
+        queue. Returns ``(train_result, window-mean reward)``.
+        """
+        t0 = time.perf_counter()
+        samples: List[Sample] = []
+        window_rewards: List[float] = []
+        for rollout_id in window_ids:
+            inputs = self.data_source.get_samples(self.batch_size)
+            sample = self._build_request_sample(inputs, rollout_id)
+            sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
+            sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
+            samples.append(sample)
+            window_rewards.append(mean_reward)
+        final_id = window_ids[-1]
+        training_progress = final_id / max(1, num_rollouts - 1)
+        parts = tuple(sample.parts[-1] for sample in samples)
+        result = self.stack.train_track(
+            parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+        )
+        # Reward stats must cover the whole window: with per-domain scorers each
+        # rollout is NaN outside its own domain, so the final sample alone would
+        # leave every other domain's curve empty. The pooled keys override the
+        # final sample's partial ones inside log_rollout_step.
+        extra = pooled_window_reward_metrics(list(parts)) if len(parts) > 1 else None
+        self.wandb_logger.log_rollout_step(
+            final_id, result, samples[-1], step_time_s=time.perf_counter() - t0, extra_metrics=extra
+        )
+        return result, sum(window_rewards) / len(window_rewards)
+
     def evaluate(
         self,
         step: int,
@@ -604,28 +654,14 @@ class DiffusionTrainer(BaseTrainer):
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)
             for window_start in range(start_rollout, num_rollouts, acc):
-                t0 = time.perf_counter()
-                samples: List[Sample] = []
-                window_rewards: List[float] = []
-                for rollout_id in range(window_start, min(window_start + acc, num_rollouts)):
-                    inputs = self.data_source.get_samples(self.batch_size)
-                    sample = self._build_request_sample(inputs, rollout_id)
-                    sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
-                        resumed and rollout_id == start_rollout
-                    )
-                    sample, mean_reward = self._rollout_and_score(
-                        sample, sync_weights=sync_weights, rollout_id=rollout_id
-                    )
-                    samples.append(sample)
-                    window_rewards.append(mean_reward)
-                final_id = window_start + len(samples) - 1
-                training_progress = final_id / max(1, num_rollouts - 1)
-                parts = tuple(sample.parts[-1] for sample in samples)
-                result = self.stack.train_track(
-                    parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+                window_ids = range(window_start, min(window_start + acc, num_rollouts))
+                result, mean_reward = self.train_step(
+                    window_ids,
+                    num_rollouts=num_rollouts,
+                    weight_sync_interval=interval,
+                    force_sync_at=start_rollout if resumed else None,
                 )
-                mean_reward = sum(window_rewards) / len(window_rewards)
-                self.wandb_logger.log_rollout_step(final_id, result, samples[-1], step_time_s=time.perf_counter() - t0)
+                final_id = window_ids[-1]
                 self.wandb_logger.log_progress(final_id, num_rollouts, result, mean_reward, logger=logger)
                 if self.eval_interval > 0 and (final_id + 1) % self.eval_interval == 0:
                     self.evaluate(final_id + 1)
