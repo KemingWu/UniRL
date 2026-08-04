@@ -574,7 +574,10 @@ class DiffusionTrainer(BaseTrainer):
         saved step — ``num_rollouts`` is the TOTAL budget, so resuming
         checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.
         """
-        interval = max(1, weight_sync_interval)
+        # ${oc.env:...} interpolations arrive as strings.
+        num_rollouts = int(num_rollouts)
+        save_interval = int(save_interval)
+        interval = max(1, int(weight_sync_interval))
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
         # Checkpoints never carry accumulated .grad, so every run/save/resume
