@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -161,9 +161,6 @@ class TrainStack(Remote):
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
-        # Any backward since the last zero_grad — the step decision under
-        # cross-rollout accumulation.
-        self._accum_has_backward = False
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop.
@@ -219,16 +216,17 @@ class TrainStack(Remote):
         zero_grad: bool = True,
         do_optimizer_step: bool = True,
         loss_weight: float = 1.0,
+        prior_backward: bool = False,
     ) -> TrainStepResult:
-        """Run one optimizer step over the contiguous micro ranges of a single update.
+        """Run the micro ranges of a single update; step unless mid-window.
 
         ``micros`` is one update's worth of ``(start, end)`` ranges produced by
         :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
         geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
 
-        ``zero_grad`` / ``do_optimizer_step`` / ``loss_weight`` implement
-        cross-rollout gradient accumulation (see :meth:`train_track`); the
-        defaults are the plain one-step-per-call contract.
+        The keyword flags are :meth:`_run_window`'s internal mechanics
+        (``prior_backward``: whether an earlier part of the window backwarded);
+        the defaults are the plain one-step-per-call contract.
         """
         if part.advantages is None and getattr(self.algorithm, "requires_advantages", True):
             raise ValueError(
@@ -242,7 +240,6 @@ class TrainStack(Remote):
         bs = int(part.batch_size)
         if zero_grad:
             self.fsdp_backend.zero_grad()
-            self._accum_has_backward = False
 
         loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros)
         micro_results: List[AlgorithmStepResult] = []
@@ -275,11 +272,11 @@ class TrainStack(Remote):
             [r.metrics for r in micro_results if r.metrics]
         )
 
-        self._accum_has_backward = self._accum_has_backward or has_backward
+        window_backward = prior_backward or has_backward
         # The stepping backward must run when deferred gradient sync is enabled.
         if (
             do_optimizer_step
-            and self._accum_has_backward
+            and window_backward
             and not micro_results[-1].has_backward
             and self.fsdp_backend.grad_sync_deferred
         ):
@@ -292,9 +289,9 @@ class TrainStack(Remote):
             )
 
         if not do_optimizer_step:
-            # Accumulation-only rollout: a later rollout in this window steps.
+            # Accumulation-only part: the window's final part steps.
             grad_norm = 0.0
-        elif self._accum_has_backward:
+        elif window_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
         else:
             grad_norm = 0.0
@@ -452,60 +449,99 @@ class TrainStack(Remote):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
         self,
-        part: Part,
+        parts: Union[Part, Tuple[Part, ...]],
         *,
         training_progress: float,
-        zero_grad: bool = True,
-        do_optimizer_step: bool = True,
-        loss_weight: float = 1.0,
     ) -> TrainStepResult:
-        """Driver-callable: arrange → prepare → run updates (×N) → on_rollout_end.
+        """Driver-callable: arrange → prepare → run updates → on_rollout_end.
 
-        ``zero_grad`` / ``do_optimizer_step`` / ``loss_weight`` implement
-        cross-rollout gradient accumulation (the MOPD task-cycle contract): the
-        driver zeroes on the window's first rollout, backwards every rollout at
-        ``loss_weight = 1/M``, and steps only on the window's last — so the single
-        optimizer step sees the mean gradient of all M rollouts, computed at the
-        SAME (never-stepped) student weights. Defaults are the plain
-        one-step-per-rollout contract, bit-for-bit.
+        One call = ONE optimizer step. A bare ``Part`` is the plain path; a
+        TUPLE of Parts is a gradient-accumulation window (the MOPD task cycle):
+        every part is prepared and backwarded at ``1/len(parts)`` on the same
+        never-stepped weights, and the single step sees the mean gradient of
+        the whole window. The window lives inside this one call, so a
+        checkpoint between calls can never split it. Tuple, not list — the
+        DP_SCATTER dispatcher recurses tuples element-wise (each part is
+        row-sharded), while lists are row-sliced as data.
 
         Combines the steps so worker-side mutations (``segment.sde_logp`` populated
         by ``prepare_segment``) flow into the subsequent update(s) without
         round-tripping through the driver. Dispatched ``DP_SCATTER`` so each DP
-        worker receives its shard of ``part``; per-shard loss/grad_norm/metrics
+        worker receives its shard of every part; per-shard loss/grad_norm/metrics
         merge back via ``pytree_merge``.
 
-        ``arrange`` reorders the shard (if packing) and builds the contiguous plan;
-        ``prepare_segment`` then freezes the π_old anchor once at that geometry,
-        ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
-        ``on_rollout_end`` runs once — see :meth:`_run_updates`.
+        ``arrange`` reorders each shard (if packing) and builds the contiguous
+        plan; ``prepare_segment`` freezes the π_old anchor at that geometry;
+        ``num_updates_per_batch`` optimizer steps (single-part calls only) run
+        over disjoint updates; ``on_rollout_end`` runs once.
         """
+        window = parts if isinstance(parts, tuple) else (parts,)
+        if not window:
+            raise ValueError(f"{type(self).__name__}.train_track: empty accumulation window.")
+        if len(window) > 1 and self.num_updates_per_batch > 1:
+            raise ValueError(
+                f"{type(self).__name__}.train_track: an accumulation window of {len(window)} parts "
+                f"requires num_updates_per_batch == 1 (got {self.num_updates_per_batch}) — extra "
+                "optimizer steps inside the window would re-step on partial gradients."
+            )
         self.fsdp_backend.model.eval()
-        self._align_track_inputs(part)
-        part, plans = self.micro_planner.arrange(
-            part,
-            num_updates=self.num_updates_per_batch,
-            micro_batch_size=self.micro_batch_size,
-        )
+        arranged = []
+        for part in window:
+            self._align_track_inputs(part)
+            arranged.append(
+                self.micro_planner.arrange(
+                    part,
+                    num_updates=self.num_updates_per_batch,
+                    micro_batch_size=self.micro_batch_size,
+                )
+            )
         from unirl.utils.profiling import profile_scope
 
         profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            self.prepare_segment(part, plans=plans)
-            part = self.algorithm.prepare_part(part)
+            prepared = []
+            for part, plans in arranged:
+                self.prepare_segment(part, plans=plans)
+                prepared.append((self.algorithm.prepare_part(part), plans))
             self.fsdp_backend.model.train()
-            result = self._run_updates(
-                part,
-                plans=plans,
-                training_progress=float(training_progress),
-                zero_grad=zero_grad,
-                do_optimizer_step=do_optimizer_step,
-                loss_weight=float(loss_weight),
-            )
+            if len(prepared) == 1:
+                part, plans = prepared[0]
+                result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
+            else:
+                result = self._run_window(prepared, training_progress=float(training_progress))
         if profiler is not None:
             profiler.step()
         self.on_rollout_end()
         return result
+
+    def _run_window(self, prepared: List[Tuple[Part, Plan]], *, training_progress: float) -> TrainStepResult:
+        """One optimizer step over an accumulation window of single-update parts.
+
+        Zero once, backward every part's micros at ``1/len(prepared)``, defer
+        the (ZeRO-2) gradient sync to the final part's last micro, step once.
+        The merged result reports the window-mean loss, the stepping call's
+        grad_norm, and the union of per-part metrics — per-domain keys land
+        side by side in one point.
+        """
+        m = len(prepared)
+        self.fsdp_backend.zero_grad()
+        results: List[TrainStepResult] = []
+        prior_backward = False
+        for w, (part, plans) in enumerate(prepared):
+            (micros,) = plans  # window parts are single-update (validated in train_track)
+            result = self._run_update(
+                part,
+                micros=micros,
+                training_progress=training_progress,
+                zero_grad=False,
+                do_optimizer_step=(w == m - 1),
+                loss_weight=1.0 / m,
+                prior_backward=prior_backward,
+            )
+            prior_backward = prior_backward or result.has_backward
+            results.append(result)
+        # The window is one optimizer step: its grad_norm is the stepping call's.
+        return replace(_aggregate_update_results(results), grad_norm=results[-1].grad_norm)
 
     def _train_step_profiler(self):
         """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
@@ -523,9 +559,6 @@ class TrainStack(Remote):
         *,
         plans: Plan,
         training_progress: float,
-        zero_grad: bool = True,
-        do_optimizer_step: bool = True,
-        loss_weight: float = 1.0,
     ) -> TrainStepResult:
         """Run ``num_updates_per_batch`` optimizer steps over disjoint updates.
 
@@ -541,13 +574,6 @@ class TrainStack(Remote):
         """
         from unirl.utils.profiling import maybe_profile_update, profile_scope
 
-        if len(plans) > 1 and (not zero_grad or not do_optimizer_step or loss_weight != 1.0):
-            raise ValueError(
-                f"{type(self).__name__}._run_updates: cross-rollout gradient accumulation "
-                "(zero_grad=False / do_optimizer_step=False / loss_weight != 1) requires "
-                "num_updates_per_batch == 1 — multiple optimizer steps inside one accumulation "
-                "window would re-step on partially accumulated gradients."
-            )
         scope_update = profile_scope() == "one-update"
         results = []
         for micros in plans:
@@ -557,16 +583,7 @@ class TrainStack(Remote):
                 else nullcontext()
             )
             with cm:
-                results.append(
-                    self._run_update(
-                        part,
-                        micros=micros,
-                        training_progress=training_progress,
-                        zero_grad=zero_grad,
-                        do_optimizer_step=do_optimizer_step,
-                        loss_weight=loss_weight,
-                    )
-                )
+                results.append(self._run_update(part, micros=micros, training_progress=training_progress))
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)

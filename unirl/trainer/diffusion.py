@@ -11,7 +11,6 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.primitives import Texts
@@ -138,48 +137,11 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward = remote_hydra(reward_cfg)
                 self._wire_eval_suites()
 
-        # Reward is optional only for requires_advantages=False algorithms.
-        if self.reward is None:
-            if self._algo_requires_advantages:
-                raise ValueError(
-                    "The recipe has no `reward:` block, but the algorithm requires advantages "
-                    "(requires_advantages=True) — RL training cannot run without a reward model. "
-                    "Only supervised/teacher-anchored algorithms may omit `reward:`."
-                )
-            if self.eval_interval > 0:
-                raise ValueError(
-                    f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
-                    "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
-                    "(monitoring-only) reward."
-                )
-
+        self._validate_reward_config()
         # Cross-rollout gradient accumulation: one optimizer step per M rollouts
         # (the MOPD task-cycle contract).
         self.accumulate_rollouts = int(accumulate_rollouts)
-        if self.accumulate_rollouts < 1:
-            raise ValueError(f"accumulate_rollouts must be >= 1, got {accumulate_rollouts}")
-        if self.accumulate_rollouts > 1:
-            n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
-            if n_updates != 1:
-                raise ValueError(
-                    f"accumulate_rollouts={self.accumulate_rollouts} requires "
-                    f"stack.num_updates_per_batch == 1 (got {n_updates}): multiple optimizer steps "
-                    "inside one accumulation window would re-step on partially accumulated gradients."
-                )
-            if self._uses_ema:
-                raise ValueError(
-                    f"accumulate_rollouts={self.accumulate_rollouts} is not validated with "
-                    "requires_ema_rollout algorithms (EMA updates fire per rollout boundary, "
-                    "not per optimizer step)."
-                )
-            domains = getattr(self.data_source, "domains", None)
-            if domains and self.accumulate_rollouts % len(domains) != 0:
-                raise ValueError(
-                    f"accumulate_rollouts={self.accumulate_rollouts} must be a multiple of the "
-                    f"data source's domain count ({len(domains)}), or each optimizer step would "
-                    "cover an uneven subset of the task cycle (mirrors the official DiffusionOPD "
-                    "assert on num_batches_per_epoch % len(teachers))."
-                )
+        self._validate_accumulation(stack_cfg)
 
         # Require rollout counts to divide both policy and reward DP sizes.
         n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
@@ -191,6 +153,56 @@ class DiffusionTrainer(BaseTrainer):
                 f"{reward_dp}. reward_fraction={reward_fraction} placed reward on its own slab, "
                 f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
                 f"samples_per_prompt divisible by both."
+            )
+
+    def _validate_reward_config(self) -> None:
+        """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
+        if self.reward is not None:
+            return
+        if self._algo_requires_advantages:
+            raise ValueError(
+                "The recipe has no `reward:` block, but the algorithm requires advantages "
+                "(requires_advantages=True) — RL training cannot run without a reward model. "
+                "Only supervised/teacher-anchored algorithms may omit `reward:`."
+            )
+        if self.eval_interval > 0:
+            raise ValueError(
+                f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
+                "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                "(monitoring-only) reward."
+            )
+
+    def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
+        """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
+        acc = self.accumulate_rollouts
+        if acc < 1:
+            raise ValueError(f"accumulate_rollouts must be >= 1, got {acc}")
+        if acc == 1:
+            return
+        n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
+        if n_updates != 1:
+            raise ValueError(
+                f"accumulate_rollouts={acc} requires stack.num_updates_per_batch == 1 "
+                f"(got {n_updates}): extra optimizer steps inside one accumulation window "
+                "would re-step on partial gradients."
+            )
+        if self._uses_ema:
+            raise ValueError(
+                f"accumulate_rollouts={acc} is not validated with requires_ema_rollout "
+                "algorithms (EMA updates fire per rollout boundary, not per optimizer step)."
+            )
+        if self.eval_interval > 0 and self.eval_interval % acc:
+            raise ValueError(
+                f"eval_interval={self.eval_interval} is not a multiple of accumulate_rollouts={acc}: "
+                "eval runs between windows, so this cadence would never fire."
+            )
+        domains = getattr(self.data_source, "domains", None)
+        if domains and acc % len(domains) != 0:
+            raise ValueError(
+                f"accumulate_rollouts={acc} must be a multiple of the data source's domain "
+                f"count ({len(domains)}), or each optimizer step would cover an uneven subset "
+                "of the task cycle (mirrors the official DiffusionOPD assert on "
+                "num_batches_per_epoch % len(teachers))."
             )
 
     def _wire_eval_suites(self) -> None:
@@ -369,29 +381,23 @@ class DiffusionTrainer(BaseTrainer):
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 
-    def train_step(
+    def _rollout_and_score(
         self,
         sample: Sample,
         *,
-        training_progress: float = 0.0,
         sync_weights: bool = False,
         rollout_id: int = 0,
-    ) -> Tuple[TrainStepResult, float]:
-        """One ``rollout → reward → advantage → optimizer step`` pass.
-
-        ``training_progress`` in ``[0, 1]`` drives clip-range / LR schedules
-        inside the algorithm. The reference trainer is stateless — the
-        outer training loop owns step counting; ``rollout_id`` only keys the
-        wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
+    ) -> Tuple[Sample, float]:
+        """One ``rollout → reward → advantage`` pass; training happens per window.
 
         ``sync_weights`` pushes the latest LoRA into the engine between
         ``wake_up`` and ``generate`` — one wake/sleep instead of two, with this
         ``generate`` already using the fresh adapter.
 
-        Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the frontier gen Part (0.0 if none), for the log line.
+        Returns ``(sample, mean_reward)`` — the scored Sample (advantages and
+        row metadata attached) and the mean unnormalized per-sample reward of
+        the frontier gen Part (0.0 if none), for the log line.
         """
-        t0 = time.perf_counter()
         self.rollout.wake_up()
         if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
@@ -438,18 +444,7 @@ class DiffusionTrainer(BaseTrainer):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._drop_decoded(sample, rollout_id=rollout_id)
-        # Accumulation phase derives from the absolute rollout_id, so resume
-        # re-enters the window at the right phase with no extra state.
-        acc = self.accumulate_rollouts
-        result = self.stack.train_track(
-            sample.parts[-1],
-            training_progress=float(training_progress),
-            zero_grad=(rollout_id % acc == 0),
-            do_optimizer_step=((rollout_id + 1) % acc == 0),
-            loss_weight=1.0 / acc,
-        )
-        self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
-        return result, mean_reward
+        return sample, mean_reward
 
     def evaluate(
         self,
@@ -460,7 +455,7 @@ class DiffusionTrainer(BaseTrainer):
     ) -> float:
         """Periodic eval on the eval set (no training); returns the mean reward.
 
-        Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
+        Mirrors :meth:`_rollout_and_score`'s rollout+reward path but skips advantage/backward.
         Generates at the deterministic best-quality setting (``cfg_text_scale=
         eval_cfg_text_scale``, ``eta=eval_eta``; ``eval_samples_per_prompt`` x_T per
         prompt) and scores. The training reward plus every shared-set
@@ -561,10 +556,12 @@ class DiffusionTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
+        """Minimal training loop: ``num_rollouts`` rollouts in windows of
+        ``accumulate_rollouts``, one ``train_track`` call (= one optimizer
+        step) per window; logging/eval/save run between windows.
 
         ``weight_sync_interval``: sync the adapter into the engine every N
-        rollouts (fused into ``train_step``'s generate; no-op trainside).
+        rollouts (fused into the rollout's generate; no-op trainside).
 
         ``save_interval``: write a checkpoint every N rollouts (and on the last
         one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
@@ -580,27 +577,19 @@ class DiffusionTrainer(BaseTrainer):
         interval = max(1, int(weight_sync_interval))
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Checkpoints never carry accumulated .grad, so every run/save/resume
-        # boundary must land on a full accumulation window.
+        # A window is ONE train_track call, so checkpoints can never split it;
+        # cadences are checked at window ends and must land on them to fire.
         acc = self.accumulate_rollouts
         if acc > 1:
             if num_rollouts % acc:
                 raise ValueError(
                     f"num_rollouts={num_rollouts} is not a multiple of accumulate_rollouts={acc}: "
-                    "the final window would backward without ever stepping, and the final "
-                    "checkpoint would land mid-window."
+                    "the MOPD protocol steps once per FULL task cycle."
                 )
             if save_interval > 0 and save_interval % acc:
                 raise ValueError(
                     f"save_interval={save_interval} is not a multiple of accumulate_rollouts={acc}: "
-                    "a mid-window checkpoint cannot carry the window's accumulated gradients, so "
-                    "resuming from it would step on a partial task cycle."
-                )
-            if start_rollout % acc:
-                raise ValueError(
-                    f"resume checkpoint is at rollout {start_rollout}, mid-window for "
-                    f"accumulate_rollouts={acc}: the gradients accumulated before the save were "
-                    "not (and cannot be) restored. Resume from a window-boundary checkpoint."
+                    "checkpoints are written between windows, so this cadence would never fire."
                 )
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
@@ -608,24 +597,34 @@ class DiffusionTrainer(BaseTrainer):
         try:
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)
-            for rollout_id in range(start_rollout, num_rollouts):
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                inputs = self.data_source.get_samples(self.batch_size)
-                sample = self._build_request_sample(inputs, rollout_id)
-                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
-                    resumed and rollout_id == start_rollout
+            for window_start in range(start_rollout, num_rollouts, acc):
+                t0 = time.perf_counter()
+                samples: List[Sample] = []
+                window_rewards: List[float] = []
+                for rollout_id in range(window_start, min(window_start + acc, num_rollouts)):
+                    inputs = self.data_source.get_samples(self.batch_size)
+                    sample = self._build_request_sample(inputs, rollout_id)
+                    sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                        resumed and rollout_id == start_rollout
+                    )
+                    sample, mean_reward = self._rollout_and_score(
+                        sample, sync_weights=sync_weights, rollout_id=rollout_id
+                    )
+                    samples.append(sample)
+                    window_rewards.append(mean_reward)
+                final_id = window_start + len(samples) - 1
+                training_progress = final_id / max(1, num_rollouts - 1)
+                parts = tuple(sample.parts[-1] for sample in samples)
+                result = self.stack.train_track(
+                    parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
                 )
-                result, mean_reward = self.train_step(
-                    sample,
-                    training_progress=training_progress,
-                    sync_weights=sync_weights,
-                    rollout_id=rollout_id,
-                )
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
-                    self.evaluate(rollout_id + 1)
+                mean_reward = sum(window_rewards) / len(window_rewards)
+                self.wandb_logger.log_rollout_step(final_id, result, samples[-1], step_time_s=time.perf_counter() - t0)
+                self.wandb_logger.log_progress(final_id, num_rollouts, result, mean_reward, logger=logger)
+                if self.eval_interval > 0 and (final_id + 1) % self.eval_interval == 0:
+                    self.evaluate(final_id + 1)
                 self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                    final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
             self._finish_wandb()
