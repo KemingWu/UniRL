@@ -58,12 +58,9 @@ class LoraConfig:
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
-    # Additional frozen, inference-only adapters injected next to the trainable
-    # ``default`` (e.g. DiffusionOPD teachers). Entries carry ``name`` + ``path``
-    # (see :class:`FrozenAdapterSpec`; plain dicts are accepted — ``Any`` for the
-    # same OmegaConf 2.3 reason as ``target_modules``). Sound only on this
-    # plain-LoRA path: the base weights stay frozen, so a teacher's deltas keep
-    # referring to the weights it was trained against.
+    # Frozen inference-only adapters next to the trainable ``default`` (e.g. OPD
+    # teachers): {name, path} entries (``Any`` for the same OmegaConf 2.3 reason
+    # as ``target_modules``).
     frozen_adapters: Any = None
 
 

@@ -161,9 +161,8 @@ class TrainStack(Remote):
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
-        # Whether any rollout since the last ``zero_grad=True`` call reported a
-        # backward — the optimizer-step decision under cross-rollout gradient
-        # accumulation (``train_track(..., do_optimizer_step=False)`` windows).
+        # Any backward since the last zero_grad — the step decision under
+        # cross-rollout accumulation.
         self._accum_has_backward = False
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
@@ -262,9 +261,7 @@ class TrainStack(Remote):
                 segment=micro_part.segment,
                 advantages=micro_part.advantages,
                 training_progress=training_progress,
-                # ``loss_weight`` (1/M under accumulation) scales ONLY the backward;
-                # ``result.loss`` stays the raw micro mean, so logged losses remain
-                # comparable across accumulation settings.
+                # loss_weight (1/M) scales only the backward; result.loss stays the raw micro mean.
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
@@ -295,8 +292,7 @@ class TrainStack(Remote):
             )
 
         if not do_optimizer_step:
-            # Accumulation-only rollout: gradients stay on the params; a later
-            # rollout in this accumulation window performs the optimizer step.
+            # Accumulation-only rollout: a later rollout in this window steps.
             grad_norm = 0.0
         elif self._accum_has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))

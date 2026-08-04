@@ -209,13 +209,9 @@ class BaseFSDP2Backend(Remote):
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
             )
-            # Frozen sibling adapters (e.g. DiffusionOPD teachers): injected and
-            # weight-loaded HERE, pre-wrap, so FSDP shards them with everything
-            # else and LoRA checkpoints stay save/load-symmetric. They are
-            # requires_grad=False, so the optimizer (built in
-            # ``_finalize_construction``) never sees them, and weight sync ships
-            # only its named adapter (``rollout_adapter_name``) — teachers never
-            # leak into the rollout engine.
+            # Frozen sibling adapters (e.g. OPD teachers): injected pre-wrap so FSDP
+            # shards them and checkpoints stay symmetric; requires_grad=False keeps
+            # them out of the optimizer and weight sync.
             for spec in normalize_frozen_adapters(getattr(lora_cfg, "frozen_adapters", None)):
                 inject_frozen_adapter(model, name=spec.name, path=spec.path)
         if ema_cfg is not None:

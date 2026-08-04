@@ -91,8 +91,7 @@ class DiffusionTrainer(BaseTrainer):
         )
 
         self.weight_sync = None
-        # Stays None when the recipe has no ``reward:`` block — allowed only for
-        # requires_advantages=False algorithms (validated after construction below).
+        # None when the recipe has no ``reward:`` block (validated below).
         self.reward = None
 
         reward_fraction = float(reward_fraction)
@@ -233,9 +232,7 @@ class DiffusionTrainer(BaseTrainer):
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
-        # Supervised / teacher-anchored algorithms (requires_advantages=False)
-        # keep rewards for monitoring but skip the advantage derivation in
-        # ``train_step`` — the stack accepts ``advantages=None`` for them.
+        # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
         algo_extra = {"backend": self.backend} if needs_backend else {}
@@ -432,12 +429,8 @@ class DiffusionTrainer(BaseTrainer):
                 part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
                 sample = sample.with_parts([*sample.parts[:-1], part])
 
-        # Project the prompt-side per-row metadata onto the train Part.
-        # Input metadata is authored on the root input Part; algorithms that
-        # route on it (DiffusionOPD reads metadata["domain"] in prepare_part)
-        # need it aligned to the gen Part's rows. Only fills an empty field and
-        # only when the root actually carries metadata, so recipes without
-        # dataset metadata see no change.
+        # Project root-Part metadata onto the gen Part's rows (DiffusionOPD routes
+        # on metadata["domain"]); only ever fills an empty field.
         gen_part = sample.parts[-1]
         if not gen_part.metadata:
             root_md = sample.root_metadata(-1)
@@ -445,10 +438,8 @@ class DiffusionTrainer(BaseTrainer):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._drop_decoded(sample, rollout_id=rollout_id)
-        # Accumulation phase from the ABSOLUTE rollout_id, so checkpoint resume
-        # re-enters the cycle at the right phase with no extra state. With
-        # accumulate_rollouts=1 the flags are (True, True, 1.0) — the plain
-        # one-step-per-rollout contract, bit-for-bit.
+        # Accumulation phase derives from the absolute rollout_id, so resume
+        # re-enters the window at the right phase with no extra state.
         acc = self.accumulate_rollouts
         result = self.stack.train_track(
             sample.parts[-1],

@@ -630,9 +630,8 @@ class MultiDomainRLDataSource:
                     f"would produce an empty DataLoader with drop_last=True "
                     f"(num_prompts={len(ds)}, prompts_per_rollout={self.prompts_per_rollout})."
                 )
-            # One generator per domain, offset by index so the domains don't
-            # shuffle in lockstep. seed=None -> OS entropy (non-reproducible,
-            # matching MultimodalRLDataSource's seed=null contract).
+            # Per-domain generator offset by index; seed=None -> OS entropy
+            # (the base class's seed=null contract).
             generator = torch.Generator()
             if self.seed is None:
                 generator.manual_seed(int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF)

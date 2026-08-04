@@ -88,11 +88,9 @@ class DiffusionOPD(StageAlgorithm):
     """
 
     requires_ema_rollout = False
-    # Teacher means depend only on the frozen rollout trajectory, but the
-    # multi-update path is unvalidated — mirror DiffusionNFT's conservatism.
+    # Multi-update against the teacher anchor is unvalidated.
     supports_multi_update = False
-    # The teacher adapters live on the FSDP-wrapped trainable model, so the v2
-    # trainer must inject the backend sibling.
+    # Teacher adapters live on the trainable model; the trainer injects the backend.
     requires_backend = True
     # Supervision is teacher-driven; rewards (if any) are monitoring-only.
     requires_advantages = False
@@ -255,9 +253,7 @@ class DiffusionOPD(StageAlgorithm):
             )
 
         teacher_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means")
-        # fp32 before the squared difference: under autocast the means come back
-        # bf16, and the KL is a per-pixel MSE reduced over ~1e5 elements — bf16
-        # squaring loses the signal as the student converges to the teacher.
+        # fp32 before squaring: bf16 loses the shrinking teacher-student delta.
         student_f32 = student_means.float()
         teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
 
@@ -277,9 +273,7 @@ class DiffusionOPD(StageAlgorithm):
 
         metrics: Dict[str, Any] = {"distill_loss": float(loss.detach().item())}
         if self._active_teacher is not None:
-            # Per-teacher curve: only this rollout's domain emits the key, so
-            # wandb shows one series per teacher that ticks on its own iters
-            # (same convention as the per-domain reward curves).
+            # Only this rollout's domain emits the key -> one wandb series per teacher.
             metrics[f"distill_loss_{self._active_teacher}"] = metrics["distill_loss"]
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),

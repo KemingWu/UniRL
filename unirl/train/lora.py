@@ -319,11 +319,9 @@ def inject_frozen_adapter(
             f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
             "line up with this model — refusing a silently partial teacher."
         )
-    # ``missing_keys`` from the strict=False load spans the WHOLE model (base
-    # weights, the trainable adapter, other frozen adapters) — only entries whose
-    # lora bank is keyed by THIS adapter indicate a truncated checkpoint. peft
-    # zero-initializes ``lora_B``, so a missing tensor would silently null the
-    # teacher's delta on that layer while everything else keeps training.
+    # strict=False ``missing_keys`` spans the whole model; only THIS adapter's lora
+    # banks indicate a truncated checkpoint (peft zero-inits ``lora_B`` -> a missing
+    # tensor silently nulls the teacher on that layer).
     missing: list = []
     for key in getattr(load_result, "missing_keys", None) or []:
         parts = key.split(".")
@@ -341,8 +339,7 @@ def inject_frozen_adapter(
         )
 
     _set_adapter_requires_grad(model, name, False)
-    # peft's inject/set paths activate the new adapter and flip requires_grad on
-    # the others as a side effect — restore the plain-LoRA resting state.
+    # peft's inject/set paths flip other adapters' requires_grad; restore the resting state.
     _activate(model, trainable_adapter)
     _set_adapter_requires_grad(model, trainable_adapter, True)
     # Mirror inject_nft: keep diffusers' PeftAdapterMixin bookkeeping consistent.
