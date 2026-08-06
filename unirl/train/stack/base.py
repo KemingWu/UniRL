@@ -484,7 +484,6 @@ class TrainStack(Remote):
                 f"requires num_updates_per_batch == 1 (got {self.num_updates_per_batch}) — extra "
                 "optimizer steps inside the window would re-step on partial gradients."
             )
-        self.fsdp_backend.model.eval()
         arranged = []
         for part in window:
             self._align_track_inputs(part)
@@ -499,35 +498,51 @@ class TrainStack(Remote):
 
         profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            prepared = []
-            for part, plans in arranged:
-                self.prepare_segment(part, plans=plans)
-                prepared.append((self.algorithm.prepare_part(part), plans))
-            self.fsdp_backend.model.train()
-            if len(prepared) == 1:
-                part, plans = prepared[0]
+            if len(arranged) == 1:
+                part, plans = arranged[0]
+                part = self._prepare_for_training(part, plans=plans)
                 result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
             else:
-                result = self._run_window(prepared, training_progress=float(training_progress))
+                result = self._run_window(arranged, training_progress=float(training_progress))
         if profiler is not None:
             profiler.step()
         self.on_rollout_end()
         return result
 
-    def _run_window(self, prepared: List[Tuple[Part, Plan]], *, training_progress: float) -> TrainStepResult:
+    def _prepare_for_training(self, part: Part, *, plans: Plan) -> Part:
+        """Freeze this part's anchor in eval mode, then return the model to train mode.
+
+        Eval mode keeps train-time stochasticity (notably dropout) out of the
+        anchor forward; the gradient-bearing replay needs train mode so HF
+        gradient checkpointing, which is gated on ``self.training``, engages.
+        """
+        self.fsdp_backend.model.eval()
+        self.prepare_segment(part, plans=plans)
+        part = self.algorithm.prepare_part(part)
+        self.fsdp_backend.model.train()
+        return part
+
+    def _run_window(self, arranged: List[Tuple[Part, Plan]], *, training_progress: float) -> TrainStepResult:
         """One optimizer step over an accumulation window of single-update parts.
 
-        Zero once, backward every part's micros at ``1/len(prepared)``, defer
-        the (ZeRO-2) gradient sync to the final part's last micro, step once.
-        The merged result reports the window-mean loss, the stepping call's
-        grad_norm, and the union of per-part metrics — per-domain keys land
-        side by side in one point.
+        Zero once, then per part: prepare its anchor and immediately backward its
+        micros at ``1/len(arranged)``. Preparing each part right before its own
+        backward keeps any per-part state the algorithm sets in ``prepare_part``
+        (DiffusionOPD's active teacher, which names the per-domain loss metric)
+        valid for that part's loss. Gradients are identical either way — no step
+        happens inside the window, so every part sees the same weights.
+
+        The (ZeRO-2) gradient sync is deferred to the final part's last micro and
+        the step runs once. The merged result reports the window-mean loss, the
+        stepping call's grad_norm, and the union of per-part metrics — per-domain
+        keys land side by side in one point.
         """
-        m = len(prepared)
+        m = len(arranged)
         self.fsdp_backend.zero_grad()
         results: List[TrainStepResult] = []
         prior_backward = False
-        for w, (part, plans) in enumerate(prepared):
+        for w, (part, plans) in enumerate(arranged):
+            part = self._prepare_for_training(part, plans=plans)
             (micros,) = plans  # window parts are single-update (validated in train_track)
             result = self._run_update(
                 part,
