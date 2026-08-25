@@ -1,0 +1,418 @@
+# @package _global_
+# FLUX.2-klein-base-9B GRPO — text-rendering reward via the Qwen3-VL-MoE-235B
+# judge (vLLM OpenAI-chat), on the English infographic prompt set.
+#
+# ############################################################################
+# SEVERITY-WEIGHTED REWARD — SINGLE-VARIABLE vs the 9B baseline.
+#
+# Copied verbatim from flux2_klein_9b_text_rendering_grpo_openai.yaml. The ONLY
+# functional edits are two keys inside `reward.backend.config`:
+#     severity_weighting: (absent, false) -> true
+#     undefined_severity_cost:  (absent)  -> 1.0
+# plus run_name / tags so wandb can tell the two runs apart. `alpha` stays at the
+# baseline's 0.1 — see the note at that key for why the earlier 0.25 was wrong.
+#
+# Everything else is byte-identical to the baseline — sampling (10 steps,
+# samples_per_prompt 16, timestep_fraction [0,0.5]), algorithm, LoRA rank/targets,
+# FSDP, data, forward_batch_size 8. Verify with:
+#     diff <(sed 's/[[:space:]]*#.*//; /^$/d' flux2_klein_9b_text_rendering_grpo_openai.yaml) \
+#          <(sed 's/[[:space:]]*#.*//; /^$/d' flux2_klein_9b_textrender_severity_only.yaml)
+# Expected: exactly 4 changed lines (run_name, tags, +2 new reward keys).
+#
+# This is the recipe to use if you want the severity effect ATTRIBUTABLE. The
+# sibling flux2_klein_9b_textrender_25step_severity.yaml changes step count AND
+# samples_per_prompt AND timestep_fraction at the same time, so it cannot tell you
+# which change moved the needle.
+#
+# ⚠️ REWARD VALUES ARE NOT COMPARABLE IN ABSOLUTE TERMS across the two reward
+#    definitions. A 0.44 here and a 0.44 in the baseline mean different things
+#    (same alpha now, but a different cost function). Compare SPREAD:
+#      zero_std_ratio   — fraction of same-prompt groups with identical rewards.
+#                         This is the number severity is meant to fix. Lower = better.
+#      reward_std       — intra-group dispersion; the source of GRPO advantage.
+#      error_cost       — new sub-metric (remote.py:741), the weighted cost itself.
+#    Do NOT conclude anything from reward_mean moving.
+#
+# MEASURED 2026-08-09 on 123889 real TRAINING rollout samples / 1.13M errors
+# (judge_dump_severity_20260807.jsonl, this run's own dump — supersedes the
+# earlier 2252-eval-image estimate, which used a different image distribution):
+#     pairwise collision  45.2% -> 25.1%   (count -> severity, WITHIN prompt groups)
+#     group reward_std    0.0525 -> 0.0632  (1.20x)
+#     zero_std_ratio      4.33% -> 2.22%
+#     cost ratio          severity/count = 0.930   (NOT the 0.54 / 0.4724 earlier
+#                                                   estimates; see the alpha note)
+#     category mix        content 79.9% | style 11.0% | layout 9.1%
+#     content severity    14.7% strictly in (0,1) | 80.6% at 1.0 | 4.7% undefined
+#
+# ⚠️ These figures require the 2026-08-09 error_severity fix. Before it, the judge's
+#    habit of re-quoting the missing string on both sides ("原始要求【出现文字「Meals」】
+#    / 实际呈现【画面中未出现文字「Meals」】") made edit distance 0, so 48.6% of ALL
+#    errors cost NOTHING — "text absent entirely" was free while a one-letter typo
+#    cost 0.2, inverting the objective. Rollouts 1-119 of the first attempt at this
+#    run were produced under that bug and are not usable.
+# ############################################################################
+#
+# Derived from flux2_klein_4b_text_rendering_grpo_openai.yaml by swapping ONLY
+# what the 9B checkpoint actually requires. Every algorithm / data / sampling knob
+# is byte-identical to the 4B recipe (see Reward_UniRL_Train/EXPERIMENTS.md).
+#
+# Verified against the real checkpoint at
+# /apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B
+# on 2026-08-04 (transformer/config.json + text_encoder/config.json + a
+# safetensors index key scan):
+#
+#   arch                    4B              9B (this recipe)
+#   ---------------------------------------------------------------
+#   dual blocks             5               8
+#   single blocks           20              24
+#   num_attention_heads     24              32
+#   attention_head_dim      128             128
+#   text encoder hidden     2560            4096   (both 36 layers)
+#   joint_attention_dim     7680            12288  (= 3 x hidden)
+#   transformer on disk     7.3 GB bf16     17 GB bf16
+#   text encoder on disk    7.5 GB bf16     16 GB bf16
+#   guidance_embeds         false           false
+#
+# ⚠️ CORRECTION to the sibling recipes' comments: flux2_klein_trainside.yaml says
+#    the 9B is "8 dual + 48 single / Qwen3-5120" and config.py says
+#    "3 * 5120 = 15360". THIS checkpoint measures 8 dual + 24 single, hidden 4096,
+#    joint_attention_dim 12288. Those comments describe a different (larger) 9B
+#    build than the one on zwfy8 — trust the numbers above, they came from the
+#    files. Nothing functional depends on the stale comments (block CLASS names
+#    and LoRA target names are architecture-shared), but do not size memory or
+#    extraction layers off them.
+#
+# All 13 LoRA target names below were confirmed present in the 9B safetensors
+# index (8 hits each for the dual-block targets, 24 for to_qkv_mlp_proj), so the
+# name-matched list carries over unchanged.
+#
+# Launch (single train node x 8 GPU; judge runs as a SEPARATE vLLM service):
+#   FLUX2_KLEIN_9B_PATH=... REWARD_ENDPOINT=... REWARD_MODEL_NAME=... \
+#   bash examples/run_experiment_multinode_taiji.sh \
+#     diffusion/flux2_klein/flux2_klein_9b_textrender_severity_only
+#
+# ⚠️ MEMORY — READ BEFORE LAUNCHING. The 4B run measured 67.8 GB/card of 97.8 GB
+#    at batch_size=64 / samples_per_prompt=16 / forward_batch_size=16 with
+#    param_dtype=fp32 and activation_checkpointing=false. The 9B roughly doubles
+#    the resident weights (transformer 7.3->17 GB, text encoder 7.5->16 GB;
+#    the fp32 FSDP master shard grows 1.8->4.2 GB per rank). That does NOT fit in
+#    the ~30 GB of headroom the 4B left, so this recipe changes two knobs:
+#      forward_batch_size 16 -> 8      (halves rollout-forward peak)
+#      activation_checkpointing false -> true  (trades ~30% step time for memory)
+#    Both are memory levers ONLY — they do not change the optimization math, so
+#    the ablation vs 4B stays clean.
+#    MEASURED 2026-08-07: the 9B baseline (identical sampling/FSDP/forward_batch_size
+#    to this recipe) ran 178 rollouts at 61.6 GB/card of 97.8 GB — 36 GB of headroom.
+#    Severity weighting is a pure post-processing change on the judge's text output,
+#    so it costs no GPU memory. This recipe fits. If you DO hit OOM, next levers in
+#    order: forward_batch_size 8 -> 4, then meta_init_transformer: true
+#    (avoids the per-rank full-model load spike), then param_dtype bf16 (LAST
+#    resort — Klein's empirical-mu schedule is numerically sensitive and bf16
+#    master drifts reward after hundreds of rollouts).
+#
+#    Smoke first (must keep batch_size x samples_per_prompt / 8 divisible by
+#    num_updates_per_batch=2 — see Reward_UniRL_Train/train_deploy.md pitfall 2):
+#      ... batch_size=2 sampling.samples_per_prompt=8 num_rollouts=1
+#
+# ⚠️ forward_batch_size=8 < samples_per_prompt=16 means a 16-sample GRPO group is
+#    split across TWO rollout-forward chunks. With init_same_noise: true the group
+#    still shares its initial latent (the driver precomputes it per group via
+#    latent_shape), so the shared-noise property survives the split; chunking only
+#    bounds activation peak. The 4B recipe kept 16 to avoid straddling at all —
+#    here memory forces the split. If you would rather not split, set
+#    samples_per_prompt=8 and batch_size=128 instead (same 1024 global samples,
+#    same per-worker 128, groups intact) — but that halves group size, which DOES
+#    change GRPO advantage variance and breaks single-variable comparison vs 4B.
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 × 16 samples = 1024 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein9b-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,flux2klein9b_textrender_severity_only}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["flux2-klein-9b", "grpo", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat", "severity-reward"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    # Weights live on apdcephfs_zwfy8, NOT the original apdcephfs_hldy2 copy:
+    # hldy2 reads at 77 MB/s single-stream but collapses to ~1.3 MB/s per worker
+    # under 8-way concurrent load. zwfy8 reads at 1.4 GB/s. This matters MORE for
+    # the 9B than the 4B: 33 GB of weights per rank instead of 15 GB.
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_9B_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B}
+    model_precision: bf16
+    max_sequence_length: 512
+    # 3 extraction layers → 3 × 4096 = 12288 = transformer.joint_attention_dim (9B).
+    # Verified against this checkpoint. All < the 36-layer text encoder, so valid
+    # as-is — same indices as the 4B, which also has 36 layers.
+    qwen3_extraction_layers: [9, 18, 27]
+    # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
+    # shifting (build_schedule_policy) and this value is ignored at runtime.
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FLUX.2-klein transformer block classes (dual-stream + single-stream); match
+  # diffusers Flux2Transformer2DModel._no_split_modules. Same for 4B and 9B.
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # fp32 master — Klein's empirical-mu schedule is numerically sensitive; bf16
+    # master weights drift reward after ~hundreds of rollouts. Kept at fp32 for
+    # the 9B too: dropping to bf16 would be a second variable AND a known-bad one.
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # ON for the 9B (4B had it off "deliberately (speed)"). Recomputing block
+    # activations in backward is the cheapest large memory win available without
+    # touching the optimization math. Expect ~30% slower train step — irrelevant
+    # here, since the 4B run measured the judge, not the train step, as the
+    # bottleneck (15.7 min/rollout, GPUs at 0% util while awaiting reward).
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Name-matched (endswith) LoRA targets. Confirmed against the 9B safetensors
+    # index: every dual-block target resolves 8× (8 dual blocks) and
+    # to_qkv_mlp_proj resolves 24× (24 single blocks). Identical list to the 4B.
+    target_modules:
+      # DUAL block (Flux2TransformerBlock): image-stream attention
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      # DUAL block: text-stream attention (klein is dual-stream)
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      # DUAL block: image FFN + text FFN
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      # SINGLE block (Flux2SingleTransformerBlock): fused QKV+MLP linear
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # 8, not the 4B's 16 — memory (see the header warning). Halves the rollout
+  # forward's activation peak at the cost of splitting each 16-sample group
+  # across two chunks; init_same_noise still holds because the group's initial
+  # latent is driver-precomputed, not chunk-derived.
+  forward_batch_size: 8
+
+# Reward: byte-identical to the 4B recipe — same judge, same alpha, same
+# concurrency. This is the controlled variable; do not tune it here or the
+# 4B-vs-9B comparison stops being single-variable.
+#
+# alpha=0.1 was calibrated on klein-4B's measured n_errors = 8..15. The 9B is a
+# stronger model and may well produce FEWER errors; if its rewards cluster near
+# the top of exp() (say n_errors < 4, reward > 0.67) the intra-group spread that
+# GRPO needs will shrink. Check the first ~20 rollouts' reward distribution and
+# recalibrate alpha if it is flat — but record it in EXPERIMENTS.md as a second
+# variable when you do.
+#
+# ⚠️ Throughput: ONE 8×H800 TP=8 judge is the RL bottleneck (4B measured 15.7
+#    min/rollout, ~13 of it pure reward latency). The 9B generates slower, so its
+#    rollout wall-clock will be worse. Judge-side metrics from the 4B run showed
+#    `Waiting: 0` on 99.1% of samples and KV cache at ~48% median — the client was
+#    UNDER-feeding the server, so raising request_concurrency is the cheap first
+#    fix. Left at 32 here to keep parity with the 4B baseline; change it in a
+#    dedicated throughput experiment, not in this one.
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Single server (dev): set REWARD_ENDPOINT + REWARD_MODEL_NAME to that
+      # server's URL / served id. REWARD_MODEL_NAME MUST match what
+      # /v1/models reports, or every request 404s — a single-server vLLM without
+      # --served-model-name reports the full weights PATH, not "qwen3vl-judge".
+      # Cluster: set REWARD_ENDPOINTS_FILE and leave REWARD_ENDPOINT empty.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      # 0.1 — the SAME value as the count-based baseline, deliberately.
+      # An earlier revision used 0.25, on the theory that severity shrinks the cost
+      # to ~0.54x len(errors) (extrapolated from ONE 6-error sample: 3.2626/6).
+      # Measured on a 123k-sample dump from this run's own rollouts, that reasoning
+      # fails twice:
+      #   1. The ratio is 0.93, not 0.54 (weighted cost 8.41 vs n_errors 9.04) —
+      #      most content errors are absent-or-garbled and score a full 1.0, so
+      #      there is almost nothing to rescale.
+      #   2. "Narrower range = weaker signal" does not hold. GRPO normalises
+      #      advantages per group ((r-mean)/std, RolloutTrack.compute_advantages),
+      #      so alpha's SCALE cancels out of the gradient: sweeping alpha
+      #      0.05..0.35 leaves the pairwise collision rate at 25.1% and
+      #      zero_std_ratio at 2.21% — unchanged to the digit.
+      # What alpha does control is exp()'s curvature, and too large saturates the
+      # tail: at 0.25 a p95 cost of 17 maps to 0.014 and 3% of samples fall under
+      # 0.01, so a group's worst samples become mutually indistinguishable and stop
+      # contributing advantage. At 0.1 nothing saturates (p95 -> 0.183).
+      # Holding alpha at the baseline value is also what keeps this run a genuine
+      # single-variable comparison: only the cost DEFINITION changes.
+      alpha: 0.1
+      # ── THE variable under test ──
+      # The baseline collapses the judge's rich per-error output to len(errors).
+      # With klein's measured n_errors=8..15 that reward has only ~8 reachable
+      # values, so same-prompt samples collide — and a colliding PAIR contributes
+      # exactly 0 GRPO advantage (no gradient). It also prices a fully garbled
+      # title the same as one wrong letter.
+      # Here each error costs the normalised edit distance between 原始要求 and
+      # 实际呈现 instead — continuous in [0,1], so collisions become rare:
+      #   「Chain」  -> 「Clain」                  0.20
+      #   「Tires」  -> 「Tres」                   0.20
+      #   「Spark Plug」 -> 「Spark Plug sparnorf」 0.47
+      #   required text missing entirely           1.00
+      severity_weighting: true
+      # Layout/style errors describe a RELATION ("位于表头行" vs "实际位于左侧列"),
+      # not a misspelling, so severity is undefined for them and they take a flat
+      # cost. 1.0 = same weight as a maximally-wrong content error; 0.0 would make
+      # them free.
+      #
+      # ⚠️ ALL THREE CATEGORIES STAY AT 1.0, so this run refines CONTENT errors
+      #    ONLY: a 1-letter typo drops 1.0 -> 0.2, while "文字对但放错位置" and
+      #    "字体不对" still cost a full 1.0 each. Deliberate — it keeps severity the
+      #    single variable. Whether layout/style should weigh less is a separate
+      #    experiment — but the frequency is now MEASURED (2026-08-07, eval corpus):
+      #      content 79.8% (mean severity 0.338, MEDIAN 0.045) | style 10.7% | layout 9.6%
+      #    So a flat 1.0 for one wrong font weight ~= THREE typos. The imbalance is
+      #    real, but tuning it is capped at the 20.2% layout+style share, and 44.4%
+      #    of samples still land on an INTEGER cost — those are mostly content errors
+      #    whose required text is absent entirely (23.1% of content errors hit
+      #    severity 1.0, 74% of them "文字未出现"), where 1.0 is genuinely correct.
+      #    Charging absent-text MORE than 1.0 (L3) would break up more collisions
+      #    than de-weighting layout/style. Both are separate experiments.
+      #    Do not touch layout_weight / style_weight until a TRAINING-distribution
+      #    dump confirms the mix (both default to undefined_severity_cost when unset).
+      undefined_severity_cost: 1.0
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Per-rank: 8 ranks × 32 = 256 in-flight. Do NOT cut this to silence
+      # timeout warnings — the smaller batch underfeeds the judge and costs ~50%
+      # throughput (measured 32/rank ≈ 13 min vs 8/rank ≈ 20 min on 1024 samples).
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a 512² judgement genuinely takes minutes on a saturated server. An
+      # earlier 120s attempt made it WORSE (timeouts 4 → 44) by killing
+      # healthy-but-slow requests whose retries piled on more load.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge unparseable answers at temperature 0.3 — replaying at 0.0 would
+      # deterministically reproduce the same malformed output.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — JPEG artifacts can read as false rendering errors.
+      image_format: PNG
+      image_quality: 95
+      # false → a sample that exhausts HTTP retries becomes a per-sample failure
+      # marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio to work on transport failures; with the default `true`,
+      # ONE dead request out of 1024 kills the run.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output (description + box
+      # per error) to this JSONL. Empty = off, reward unchanged either way.
+      # The scalar reward keeps only len(errors), discarding the error type, the
+      # requirement-vs-actual pair and the box — analyse a dump with
+      # scripts/analyze_judge_errors.py before hand-tuning any finer-grained
+      # reward, so the weights come from measured distributions not guesses.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Loosened vs SD3's 1e-4 — Klein sigmas skew to 1.0 and the PPO ratio drifts fast.
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # per-worker batch = 64 × 16 / 8 = 128, divisible by 2. Keep this invariant when
+  # overriding batch_size / samples_per_prompt or the run dies AFTER a full
+  # rollout+reward pass (~15 min wasted) in planner/types.py:_update_ranges.
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl        # 10327 EN prompts, 170 seen classes
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl    # 870: 30 held-out classes + seen-class unseen-prompt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0           # 9B transformer has guidance_embeds=False → ignored
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: true
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

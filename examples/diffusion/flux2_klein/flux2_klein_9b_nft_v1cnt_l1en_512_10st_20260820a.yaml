@@ -1,0 +1,376 @@
+# @package _global_
+# FLUX.2-klein-9B + **DiffusionNFT** + **V1 计数 reward** + **全英文 l1 数据**（en_v3）。
+#
+# ############################################################################
+# 复刻 `flux2klein_9b_nft_textrender_0810a`（本项目**信号最强**的 run：
+# n_errors **9.00 → 1.74**，r26 就达到 GRPO 140 轮的水平，86 轮无崩塌；
+# 1024 配对 eval **Δ=+0.1180（10.5×sem）**，是次优结果的 2.3 倍）。
+#
+# **相对那个 run 只换两样，去注释后 diff 恰好 2 行（都是数据路径）**：
+#   ① 数据  datasets/rl_flux2klein_v1/*  ->  datasets/text_degrade_l1_en_v3/*
+#   ② reward model  换成 2026-08-19 的新 judge 部署 —— **配方里一个字都不用改**，
+#      endpoint 走 ${oc.env:REWARD_ENDPOINT} / ${oc.env:REWARD_MODEL_NAME}，
+#      由启动脚本注入（新部署 http://28.59.81.108:8000，served id `zehan`）。
+# 算法/LoRA/lr/采样/FSDP 全部逐字节继承 0810a —— **数据是唯一的实验变量**。
+#
+# 🚨 **reward 绝对值不可与 0810a 比**：prompt 分布换了（与 rl_flux2klein_v1 零重合，
+#    实测）。cost 定义没变（都是计数版 alpha=0.1），所以 **n_errors 是可比的尺子**。
+#    0810a 的参照轨迹（每 5 轮，89074 样本 dump）：
+#      r1-5 9.35 ｜ r16-20 6.64 ｜ r26-30 3.02 ｜ r46-50 2.18 ｜ r86 1.79
+#
+# ── 数据变了三样，归因时必须一起说 ─────────────────────────────────────────────
+#                        n     串数   prompt字符  每串字符  >=4词串占比  中文%
+#   v1（0810a 用的）  10327    8.60      372      14.32     15.9%      0
+#   **本数据集**      12687    6.45      650      24.43     39.2%      0
+#   ① 文字负载 8.60 -> 6.45 串（都在 1024 eval 实测收益区 4-14 内，占比 71%）
+#   ② 语言：两者都是纯英文 —— **语言这一维没变**（相对中英混的 l1_v1 才变了）
+#   ③ 规模 10327 -> 12687（1.23x）
+# 🚨 **唯一真实变难的一维：串更长了。** 每串 14.3 -> 24.4 字符、≥4 词长串 15.9% ->
+#    39.2%。串数少 25% 但每串长 70%，judge 要逐条查的**渲染总字符净 +28%**
+#    （123 -> 158）。⚒️ **起步 n_errors 未必低于 0810a 的 9.35；持平甚至更高都是
+#    串长效应，不要读成"数据更难"。** 要判断得从 dump 拆错误构成。
+#
+# ⚠️ **同配方在 Qwen-Image 上崩了，klein 未必重现，但要盯**：
+#    `qwen_image_nft_v1cnt_l1en_..._20260819a`（同数据、同 V1 reward、NFT）实测
+#    28 轮内 reward 0.5095→0.4839（t=−4.44）、n_errors 7.07→8.05，错误构成里
+#    「完全没渲染」18.0%→52.4%、「写错字」36.4%→0.8% —— **模型学会了不写**。
+#    klein-9B 与它的差异：512²（不是 384²）、lr 5e-5（不是 3e-4，**低 6 倍**）、
+#    LoRA r16/a32 13 项（不是 r64/a128 12 项，**容量小得多**）、fbs 8、fp32 param。
+#    这些差异都指向 klein 更稳，但**没有验证过**。⚒️ 盯 dump 里「完全没渲染」的占比，
+#    它从 ~18% 往 50% 爬就是同一个崩塌，别等 reward 曲线才发现。
+#
+# ── 数据构建 ────────────────────────────────────────────────────────────────
+# datasets/text_degrade_l1_en_v3，脚本 scripts/merge_en_l1.py（可重跑，seed 42）。
+# **全部是 L1 层，已验证**：13487 条里 8759 条精确命中各 cache 的 `l1` 字段，
+# 命中 `l0`/`l2` 的为 0；余下 4728 条是 siqi 已建好的 l1，只做英文过滤未重降级。
+#     l1_en       4728  siqi 的 degrade_l1 里筛出英文渲染的（未重降级）
+#     judgeset_v2 2802  judge 集里她没降级过的英文 prompt（我们降级，取 l1 字段）
+#     upstream6k  5957  info_image_gen_v3 上游库（该库 52836 条英文 prompt 从未用过）
+# test 的 800 条**只从没有任何 run 见过的 prompt 里抽** —— 盲 shuffle 会把
+# l1_v1 的 train 行分进 test（实测 229 条），那样 test 就是脏的。
+#
+# ── judge：2026-08-19 新部署（这是本 run 的第二个变量）──────────────────────────
+#   http://28.59.81.108:8000，served id **`zehan`**（短名，**不是权重路径** ——
+#   0810a 当时用的是权重全路径，写错会让每个请求 404；启动脚本会校验 /v1/models）。
+#   PID 673111，TP=8 + enable_expert_parallel，16k ctx，enforce_eager，vLLM 0.20.0。
+#   ⚠️ 旧的 28.7.186.23:8000（zehan 的 taiji 节点）**已死**（探测 health=000），
+#      别指回去 —— raise_on_failure=false 意味着 reward 全变 nan 而训练不报错。
+#   权重与旧部署**逐字节相同**（index json + config + shard 1/50/96 的 size+md5 全同），
+#   所以"换 reward model"实际换的是**部署实例**，不是模型。实测对比（n=128 配对）：
+#     reward 侧无实质差异（base n_errors 3.20→3.29，0.6×sem 不显著）
+#     box 定位准确率 **27.1% → 84.7%**（置换对照 15.5%/19.1%）—— box 不参与 reward，
+#     但让 dump 里的框第一次可用于定位/debug。
+#
+# Launch:
+#   SMOKE=1 bash Reward_UniRL_Train/run_train_9b_nft_v1cnt_l1en_20260820a.sh
+#   bash Reward_UniRL_Train/run_train_9b_nft_v1cnt_l1en_20260820a.sh
+# 命名规则见 Reward_UniRL_Train/NAMING_CONVENTION.md。
+#
+# 以下为继承自 0810a 的原始说明（NFT 的 6 处强制改动等）：
+# FLUX.2-klein-base-9B + DiffusionNFT — text-rendering reward via the
+# Qwen3-VL-MoE-235B judge (vLLM OpenAI-chat), on the English infographic set.
+#
+# ############################################################################
+# ALGORITHM SWAP ONLY: DiffusionNFT instead of FlowGRPO.
+#
+# Derived from flux2_klein_9b_text_rendering_grpo_openai.yaml. The `reward:` block
+# is BYTE-IDENTICAL to that baseline (count-based cost, alpha=0.1, NOT the
+# severity variant), so a comparison against it isolates the algorithm.
+# Verify the reward block never drifts:
+#     diff <(sed -n '/^reward:/,/^algorithm:/p' flux2_klein_9b_text_rendering_grpo_openai.yaml) \
+#          <(sed -n '/^reward:/,/^algorithm:/p' flux2_klein_9b_nft_text_rendering_openai.yaml)
+# Expected: no output.
+#
+# What DiffusionNFT changes vs FlowGRPO, and why each edit is forced:
+#
+#   1. backend.lora_cfg -> backend.ema_lora_cfg (EmaLoraConfig)
+#      NFT is an off-policy forward-process method with a dual-adapter EMA
+#      reference: `inject_nft` (unirl/train/ema.py:137) installs "default"
+#      (trainable) + "old" (EMA shadow); the trainer samples under "old", trains
+#      "default", and EMA-updates "old" at each rollout boundary.
+#      LoRA rank/alpha/target_modules are kept at the baseline's 16/32 and the
+#      baseline target list — do NOT copy SD3's rank 32 or Qwen-Image's rank 64
+#      here; that would change adapter capacity on top of the algorithm.
+#
+#   2. sampling.eta 0.7 -> 0.0 and scheduler.num_sde_steps 3 -> 0
+#      NFT never reads per-step SDE log-probs. It takes the CLEAN FINAL latent
+#      x0 (diffusionnft.py:221 `x0 = segment.latents[:, -1]`), re-noises it
+#      itself as xt = (1-t)*x0 + t*noise, and supervises that. Recording SDE
+#      log-probs would only burn trajectory memory.
+#      Verified safe on Klein: flux2_klein/diffusion.py:425 does `needed.add(T)`
+#      unconditionally, so with num_sde_steps=0 exactly one position (T) is
+#      stored and `latents[:, -1]` IS the clean final latent. eta=0.0 makes the
+#      rollout a deterministic Euler ODE.
+#
+#   3. sampling.timestep_fraction [0, 0.5] -> removed (defaults to 1.0)
+#      That window told FlowGRPO which steps to put SDE noise on. NFT selects
+#      training timesteps itself (`train_timestep_mode: all` +
+#      `training_timestep_fraction: 0.99`), so the rollout must not pre-restrict
+#      the range.
+#
+#   4. stack.num_updates_per_batch 2 -> 1  (MANDATORY, not a tuning choice)
+#      DiffusionNFT does not declare `supports_multi_update`, so it inherits
+#      False (algorithms/base.py:371). TrainStack raises at construction
+#      (train/stack/base.py:153) if num_updates_per_batch > 1 — a second
+#      optimizer step would train against a moving EMA anchor.
+#      Side effect: train_deploy.md pitfall 2 (batch_size × samples_per_prompt
+#      must be divisible by world_size × num_updates_per_batch) becomes
+#      vacuous — 1 divides everything. 64×16/8 = 128 per worker.
+#
+#   5. sampling.init_same_noise true -> false
+#      Shared per-group noise exists to lower variance in a ratio-based
+#      objective. NFT re-noises x0 with fresh noise during training, so the
+#      rollout noise no longer needs to be group-aligned; both NFT reference
+#      recipes use false.
+#
+#   6. adv_use_global_std: true (NEW)
+#      Both existing NFT recipes set this: divide advantages by ONE batch-wide
+#      std instead of each prompt-group's own. NFT has no per-group importance
+#      ratio to keep the scale honest, and a global std stops tiny-spread groups
+#      from being amplified into noise. NOTE this also means zero_std_ratio
+#      stops being the right health metric for this run (no per-group division).
+#
+# UNCHANGED from the baseline, deliberately: bundle/pipeline (bf16, shift 1.0,
+# qwen3_extraction_layers), FSDP (param_dtype fp32 — Klein's empirical-mu
+# schedule is numerically sensitive; bf16 master weights drift the reward),
+# activation checkpointing on, lr 5e-5, 10 inference steps, 512², batch_size 64,
+# samples_per_prompt 16, forward_batch_size 8, micro_batch_size 1, the dataset,
+# and seed 42 (same prompt order as the GRPO runs -> directly comparable).
+#
+# ⚠️ Unlike the severity recipe, lr was NOT retuned. The two NFT references use
+#    3e-4 (SD3 and Qwen-Image, both full-ish LoRA on smaller models); this keeps
+#    the klein baseline's 5e-5 so the algorithm is the only variable. If NFT
+#    turns out to underfit, lr is the first knob — and then it becomes a second
+#    variable, so record it.
+#
+# ⚠️ MEMORY IS THE MAIN UNKNOWN. ema_lora_cfg installs TWO adapter sets instead
+#    of one. Rank 16 on the baseline target list is ~110 MB/adapter, so the extra
+#    shadow is small next to the 61.6 GB/card the baseline run measured — but it
+#    is untested on 9B. SMOKE FIRST (see below); if it OOMs, drop
+#    forward_batch_size 8 -> 4 before touching anything else.
+# ############################################################################
+#
+# Smoke (~5 min, do this before any long run):
+#     SMOKE overrides: batch_size=2 sampling.samples_per_prompt=8 num_rollouts=1
+#   With num_updates_per_batch=1 any combination is legal, so unlike the GRPO
+#   recipes there is no divisibility trap to respect here.
+#
+# Launch / job submission: see
+#   Reward_UniRL_Train/train_deploy.md  (§三 local, §十 taiji job)
+# REWARD_MODEL_NAME must match what the judge's /v1/models reports, or every
+# request 404s (train_deploy.md pitfall 1).
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 × 16 samples = 1024 global)
+adv_use_global_std: true      # NFT parity: ONE batch-wide std, not per-group (see note 6)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein9b-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,klein9b_nft_v1cnt_l1en_512_10st_20260820a}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["flux2-klein-9b", "nft", "diffusionnft", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat", "en-only-data"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_9B_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B}
+    model_precision: bf16
+    max_sequence_length: 512
+    qwen3_extraction_layers: [9, 18, 27]
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: fp32           # Klein's empirical-mu schedule is numerically sensitive
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5       # baseline value, NOT the NFT references' 3e-4 (see note above)
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # DiffusionNFT dual-adapter EMA — REPLACES the baseline's lora_cfg.
+  # rank/alpha/target_modules are copied verbatim from the baseline lora_cfg so
+  # that adapter capacity is not a second variable.
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    default_adapter: default    # trainable
+    shadow_adapter: old         # EMA reference the rollout samples under
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end         # EMA-update "old" at each rollout boundary
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      - to_qkv_mlp_proj         # Flux2SingleTransformerBlock fused qkv+mlp
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 8         # baseline value; drop to 4 first if NFT OOMs
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Single server (dev): set REWARD_ENDPOINT + REWARD_MODEL_NAME to that
+      # server's URL / served id. REWARD_MODEL_NAME MUST match what
+      # /v1/models reports, or every request 404s — a single-server vLLM without
+      # --served-model-name reports the full weights PATH, not "qwen3vl-judge".
+      # Cluster: set REWARD_ENDPOINTS_FILE and leave REWARD_ENDPOINT empty.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      alpha: 0.1                  # see calibration note above (NOT the SD3 0.3)
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Per-rank: 8 ranks × 32 = 256 in-flight. Do NOT cut this to silence
+      # timeout warnings — the smaller batch underfeeds the judge and costs ~50%
+      # throughput (measured 32/rank ≈ 13 min vs 8/rank ≈ 20 min on 1024 samples).
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a 512² judgement genuinely takes minutes on a saturated server. An
+      # earlier 120s attempt made it WORSE (timeouts 4 → 44) by killing
+      # healthy-but-slow requests whose retries piled on more load.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge unparseable answers at temperature 0.3 — replaying at 0.0 would
+      # deterministically reproduce the same malformed output.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — JPEG artifacts can read as false rendering errors.
+      image_format: PNG
+      image_quality: 95
+      # false → a sample that exhausts HTTP retries becomes a per-sample failure
+      # marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio to work on transport failures; with the default `true`,
+      # ONE dead request out of 1024 kills the run.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output (description + box
+      # per error) to this JSONL. Empty = off, reward unchanged either way.
+      # The scalar reward keeps only len(errors), discarding the error type, the
+      # requirement-vs-actual pair and the box — analyse a dump with
+      # scripts/analyze_judge_errors.py before hand-tuning any finer-grained
+      # reward, so the weights come from measured distributions not guesses.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+  # DiffusionNFT loss hyperparameters — same values as both existing NFT
+  # recipes; validated in DiffusionNFT.__init__ (beta > 0, adv_clip_max > 0,
+  # adv_mode must be "raw", train_timestep_mode in {all, random},
+  # training_timestep_fraction in (0, 1], and kl_coef / apply_time_shift_in_loss
+  # must stay at 0.0 / false — both raise NotImplemented otherwise).
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.99
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # MUST be 1: DiffusionNFT inherits supports_multi_update=False, and
+  # TrainStack.__init__ raises for >1 (train/stack/base.py:153).
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/text_degrade_l1_en_v3/train.jsonl      # 12687 条全英文 L1
+      eval_data_path: datasets/text_degrade_l1_en_v3/test.jsonl  # 800 条留出（未被任何 run 训练过）
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0           # 9B transformer has guidance_embeds=False → ignored
+  height: 512
+  width: 512
+  eta: 0.0                      # DiffusionNFT: forward-process, no SDE noise injection
+  samples_per_prompt: 16
+  seed: 42                      # same prompt order as the GRPO runs
+  init_same_noise: false        # NFT re-noises x0 itself; group-aligned noise not needed
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
+    # timestep_fraction intentionally omitted (defaults to 1.0): the baseline's
+    # [0, 0.5] window scoped SDE noise for FlowGRPO; NFT picks its own training
+    # timesteps via train_timestep_mode / training_timestep_fraction.

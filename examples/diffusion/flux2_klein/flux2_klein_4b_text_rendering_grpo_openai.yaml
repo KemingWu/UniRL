@@ -1,0 +1,267 @@
+# @package _global_
+# FLUX.2-klein-base-4B GRPO — text-rendering reward via the Qwen3-VL-MoE-235B
+# judge (vLLM OpenAI-chat), on the English infographic prompt set.
+#
+# Derived from:
+#   - examples/diffusion/flux2_klein/flux2_klein_trainside.yaml  (Klein GRPO knobs)
+#   - examples/diffusion/sd3/sd3_text_rendering_grpo_openai.yaml (OpenAI-chat reward)
+#
+# Differences vs the 9B trainside recipe:
+#   - model            = FLUX.2-klein-base-4B (5 dual + 20 single blocks, Qwen3-2560
+#                        text encoder; 9B recipe was 8+48 / Qwen3-5120). block class
+#                        names and name-matched LoRA targets are architecture-shared,
+#                        so both lists carry over unchanged.
+#   - reward           = OpenAIChatRewardBackend → Qwen3-VL judge (was local PickScore)
+#   - data             = datasets/rl_flux2klein_v1 (English, <=700 chars, held-out
+#                        classes in test — built by scripts/build_rl_split.py)
+#
+# Launch (single train node × 8 GPU; judge runs as a SEPARATE vLLM service):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_4b_text_rendering_grpo_openai
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 × 16 samples = 1024 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein4b-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,flux2klein4b_text_rendering_grpo_openai}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["flux2-klein-4b", "grpo", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    # Weights live on apdcephfs_zwfy8, NOT the original apdcephfs_hldy2 copy:
+    # hldy2 reads at 77 MB/s single-stream but collapses to ~1.3 MB/s per worker
+    # under 8-way concurrent load (~200 min to load 15 GB per rank). zwfy8 reads
+    # at 1.4 GB/s. Keep large checkpoints on zwfy8 for any multi-rank job.
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_4B_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-4B}
+    model_precision: bf16
+    max_sequence_length: 512
+    # 3 extraction layers → 3 × 2560 = 7680 = transformer.joint_attention_dim (4B).
+    # All < the 4B text encoder's 36 layers, so valid as-is.
+    qwen3_extraction_layers: [9, 18, 27]
+    # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
+    # shifting (build_schedule_policy) and this value is ignored at runtime.
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FLUX.2-klein transformer block classes (dual-stream + single-stream); match
+  # diffusers Flux2Transformer2DModel._no_split_modules. Same for 4B and 9B.
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # fp32 master — Klein's empirical-mu schedule is numerically sensitive; bf16
+    # master weights drift reward after ~hundreds of rollouts.
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Name-matched (endswith) LoRA targets — architecture-shared with the 9B, so
+    # they apply to the 4B's 5 dual + 20 single blocks unchanged. See the 9B
+    # recipe for why single-block attn.to_out is intentionally excluded.
+    target_modules:
+      # DUAL block (Flux2TransformerBlock): image-stream attention
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      # DUAL block: text-stream attention (klein is dual-stream)
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      # DUAL block: image FFN + text FFN
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      # SINGLE block (Flux2SingleTransformerBlock): fused QKV+MLP linear
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 16        # = samples_per_prompt (groups don't straddle chunks)
+
+# Reward: HTTP client to the Qwen3-VL-MoE-235B judge over vLLM /v1/chat/completions.
+# The judge natively emits <answer>{"errors":[...]}</answer>; reward = exp(-alpha*n_errors).
+#
+# alpha=0.1, NOT the SD3 recipe's 0.3 — calibrated to this model's measured error
+# counts. A 6-sample smoke test of klein-4B at 512² scored n_errors = 8..15, where
+# alpha=0.3 collapses every reward into [0.011, 0.091]: GRPO advantages are computed
+# from intra-group reward spread, and a band that tight flattens the signal.
+#   n_errors:      8      10     15     20
+#   alpha=0.3:   0.091  0.050  0.011  0.002   ← all ≈0, no usable spread
+#   alpha=0.1:   0.449  0.368  0.223  0.135   ← healthy spread
+# Revisit alpha if error counts shift a lot (e.g. after training improves the model,
+# or if you change resolution): keep the working range off the flat tail of exp().
+#
+# Point REWARD_ENDPOINT at the live judge. For a multi-server cluster, drop
+# `endpoints` and set `endpoints_file` to a newline-separated URL file instead.
+#
+# ⚠️ Throughput: ONE 8×H800 TP=8 server is a bottleneck for RL — measured ~0.76
+#    img/s aggregate at concurrency 8, i.e. ~1024 samples/rollout would take ~22
+#    min of reward latency alone. Stand up a judge CLUSTER (endpoints_file) for
+#    real training. See vllm_deploy.md → launch_reward_cluster.sh.
+# Context: judge server redeployed with --max-model-len 8192, so max_new_tokens
+#    is back to 4096 (matches the SD3 recipe) — text-dense judgements won't truncate.
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs. A 235B generative judge occasionally
+  # emits a non-conforming answer even at temperature=0 (observed 1/128 on rollout
+  # 2 of the first run, which aborted training under the default strict setting).
+  # Tolerated samples are filled with the batch's succeeded-reward mean, so they
+  # contribute ~0 advantage rather than a spurious "terrible image" signal. Above
+  # 5% we still abort — that indicates a real judge/service problem, not noise.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Two ways to point at the judge; the spec merges both and dedups.
+      #  - Manual single server (dev): leave REWARD_ENDPOINTS_FILE unset and set
+      #    REWARD_ENDPOINT + REWARD_MODEL_NAME to that server's URL / served id.
+      #  - Judge CLUSTER (taiji job, the throughput fix): set
+      #    REWARD_ENDPOINTS_FILE to the CephFS file the cluster job appends to,
+      #    and leave REWARD_ENDPOINT empty. The cluster serves the judge under
+      #    `--served-model-name qwen3vl-judge`, so REWARD_MODEL_NAME must be that.
+      #    See jobs/reproduce_scripts/jobs/launch_qwen3vl_judge_cluster.sh
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      alpha: 0.1                  # see calibration note above (NOT the SD3 0.3)
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Concurrency is per-rank: 8 ranks × this = total in-flight requests.
+      # Keep this HIGH. Measured on the single TP=8 235B judge, 1024 samples:
+      #   32/rank (256 in-flight, vllm num_requests_running ~140) → ~13 min
+      #    8/rank ( 64 in-flight, running pinned at 64, zero timeouts) → ~20 min
+      # Throughput rises with batch size here — the smaller batch leaves the judge's
+      # GPUs underfed and costs ~50% throughput. Individual requests ARE slow at 256
+      # in-flight (a handful hit the timeout and get retried), but total wall-clock
+      # is what matters. Don't "fix" the timeout warnings by cutting concurrency.
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a 512² judgement genuinely takes minutes on a saturated single
+      # server. An earlier 120s attempt made it WORSE — it killed healthy-but-slow
+      # requests, and their retries piled more load onto the same server (timeouts
+      # went 4 → 44). Only tighten this if the judge is provably fast.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge a sample whose answer doesn't parse (the judge is generative and
+      # occasionally emits malformed output). Re-asks run at temperature 0.3 —
+      # replaying at 0.0 would deterministically reproduce the same bad answer.
+      # This recovers a real reward instead of falling back to neutralization,
+      # which is why max_failure_ratio above should almost never trigger now.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — text rendering is sensitive to JPEG artifacts that can
+      # read as false rendering errors; matches how the judge was validated.
+      image_format: PNG
+      image_quality: 95
+      # false, so a sample that exhausts its HTTP retries becomes a per-sample
+      # failure marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio above to be able to do its job on transport failures —
+      # with the default `true`, ONE dead request out of 1024 kills the run (that
+      # is exactly how the 15-rollout run died: "all 3 attempts failed across
+      # endpoints"). The batch-level ratio check still aborts a real outage.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output (description + box
+      # per error) to this JSONL. Empty = off, reward unchanged either way.
+      # The scalar reward keeps only len(errors), discarding the error type, the
+      # requirement-vs-actual pair and the box — analyse a dump with
+      # scripts/analyze_judge_errors.py before hand-tuning any finer-grained
+      # reward, so the weights come from measured distributions not guesses.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Loosened vs SD3's 1e-4 — Klein sigmas skew to 1.0 and the PPO ratio drifts fast.
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl        # 10327 EN prompts, 170 seen classes
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl    # 870: 30 held-out classes + seen-class unseen-prompt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0           # 4B transformer has guidance_embeds=False → ignored
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: true
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

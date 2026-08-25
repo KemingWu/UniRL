@@ -1,0 +1,171 @@
+# @package _global_
+# Qwen-Image + trainside rollout, FlowGRPO, with Qwen3-VL-MoE-235B judge as
+# reward (vLLM OpenAI-chat).
+#
+# Derived from:
+#   - examples/diffusion/qwen_image/qwen_image_trainside.yaml (model/rollout/pipeline)
+#   - examples/diffusion/flux2_klein/flux2_klein_4b_text_rendering_grpo_openai.yaml (reward)
+#
+# Launch (single train node x 8 GPU; judge runs as a SEPARATE vLLM service):
+#   REWARD_ENDPOINT=http://<judge-ip>:8000 \
+#   REWARD_MODEL_NAME=<served-model-id> \
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/qwen_image/qwen_image_sglang_openai_reward
+
+num_devices: 8
+batch_size: 48
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,diffusionrl}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_sglang_openai_reward}
+  entity: ${oc.env:WANDB_ENTITY,unix-ai-lab}
+  tags: ["qwen-image", "dancegrpo", "grpo", "sglang-diffusion", "v2", "qwen3vl-judge", "openai-chat"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/Qwen-Image-2512}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      alpha: 0.1
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      request_concurrency: 32
+      batch_size: 32
+      timeout: 300.0
+      max_retries: 3
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      image_format: PNG
+      image_quality: 95
+      raise_on_failure: false
+      # 2026-08-25 补：原先缺这一项，所以 2026-08-12 那次 `qwen_image_baseline`
+      # （跑到 315 轮）的 n_errors 轨迹至今拿不到 —— 只有 reward，而 reward 的
+      # 绝对值在换数据集后不可比（prompt 分布零重合），**n_errors 才是唯一跨数据集
+      # 可比的尺子**。纯附加、不改 reward 行为：dump 只是把 judge 已经返回的
+      # 错误列表落盘。
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

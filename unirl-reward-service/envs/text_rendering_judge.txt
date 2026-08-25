@@ -1,0 +1,12 @@
+# Text-Rendering Judge scorer — Qwen3-VL-MoE-235B error-judge for
+# text rendering in generated infographics.
+#
+# On this image, Ray runtime_env's pip isolation is broken (see
+# SUBMITTING_JOBS.md §5 and envs/geneval.txt header). This file is kept
+# EMPTY of pip requirements — the service_config validator still needs it
+# to exist, but the launcher installs vLLM directly into the base venv
+# before starting the service.
+#
+# Runtime deps (installed by launch_sd3_text_rendering_2node.sh):
+#   - vllm (any version that supports Qwen3VLMoeForConditionalGeneration)
+#   - torch, transformers (already in base image)

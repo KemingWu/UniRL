@@ -1,0 +1,382 @@
+# @package _global_
+# Qwen-Image + **DiffusionNFT** + **V3 severity reward** + **全英文 l1 数据**。
+#
+# ############################################################################
+# 与同日的 qwen_image_v1cnt_l1en_384_12st_20260819a.yaml 配对，**只差 reward**：
+#   severity_weighting: false(缺席) -> true  + undefined_severity_cost: 1.0
+# 数据/算法/模型/采样/LoRA/lr 逐字节相同，所以 V1 vs V3 是严格单变量。
+#
+#            |  V1 计数 reward                        |  V3 severity reward
+#   ---------|----------------------------------------|--------------------------
+#   本组(NFT) |  qwen_image_v1cnt_l1en_..._20260819a   |  **本 run**
+#
+# ⚠️ **两个 run 都用 NFT，都不是 qwen_image_baseline 的直接延续。** baseline 是
+#    FlowGRPO；本组换成 NFT 是因为 klein-9B 上算法维度的效应量远大于 reward 维度：
+#      算法(NFT vs GRPO)   n_errors 9.0 -> 1.74，26 轮达到 GRPO 140 轮的水平，无崩塌
+#      reward(V3/V4)       9.18 -> 7.54（92 轮），且配对 eval 只有 +0.0059(0.5×sem)
+#    所以 NFT 作为新基线，reward 版本在其上做对照。
+#    🚨 **代价：本组与 qwen_image_baseline 差了算法+数据两个维度，不可直接比。**
+#    要接回 baseline 需要另跑「GRPO + l1en」，那一格目前是空的。
+#
+# ── 相对 GRPO 配方，NFT 强制改动 6 处（全部是算法要求，不是调参）──────────────
+#   1. backend.lora_cfg -> backend.ema_lora_cfg (EmaLoraConfig)
+#      NFT 需要双 adapter：`default`(训练) + `old`(EMA 参考)，rollout 在 `old` 下采样。
+#   2. sampling.eta 0.7 -> 0.0，scheduler.num_sde_steps 3 -> 0
+#      NFT 是前向过程方法：取干净的 x0 自己重加噪，不读 SDE 的 per-step log-prob。
+#   3. scheduler.timestep_fraction [0, 0.5] -> 移除（默认 1.0）
+#      NFT 自己用 train_timestep_mode / training_timestep_fraction 选训练时间步，
+#      rollout 侧不能预先限制。
+#   4. stack.num_updates_per_batch 2 -> 1  **强制，不是调参**
+#      DiffusionNFT 继承 supports_multi_update=False（algorithms/base.py:371），
+#      TrainStack.__init__ 对 >1 直接抛错（train/stack/base.py:153）。
+#   5. sampling.init_same_noise 已是 false（qwen 配方本来就是），无需改
+#   6. adv_use_global_std: true 已是 true（qwen 配方本来就是），无需改
+#   7. algorithm._target_ FlowGRPO -> DiffusionNFT，且 **clip_range 必须删掉**
+#      （NFT 没有 ratio，不接受该参数）。
+#
+# ── 与参考配方 examples/diffusion/qwen_image/qwen_image_nft.yaml 的关系 ────────
+# **NFT 的算法超参全部取自它，逐字节相同**（去注释 diff 里这些行根本不出现）：
+#   algorithm: beta 1.0 / adv_clip_max 5.0 / adv_mode raw / use_adaptive_weight true
+#              train_timestep_mode all / shuffle_train_timesteps true
+#              apply_time_shift_in_loss false / training_timestep_fraction 0.99 / kl_coef 0.0
+#   ema_lora : rank 64 / alpha 128 / ema_decay 0.001 / ema_decay_type warmup
+#              ema_flat_steps 0 / ema_uprate 0.001 / ema_uphold 0.5 / timing rollout_end
+#              shadow_adapter old
+#   采样    : 12 步 / 384² / guidance 1.0 / spp 16 / eta 0.0 / num_sde_steps 0
+#              init_same_noise false / seed 42
+#   其余    : batch_size 48 / adv_use_global_std true / lr 3e-4 / fbs 1 / micro_batch 1
+#              max_grad_norm 1.0 / FSDP full+bf16+activation_checkpointing
+#
+#   LoRA    : **ema_lora_cfg 整块逐字节复制，含 12 项 attn+mlp target_modules**
+#   strategy: FlowSDE（与它一致）
+#
+# 相对它**只改 reward 与数据**，其余一个字都没动（2026-08-19 明确要求）：
+#   ① reward: PickScore -> Qwen3-VL judge（本项目做的是文本渲染，PickScore 是审美分，
+#      量不到"字写对没有"）；数据 pickscore/*.txt -> text_degrade_l1_en_v3
+#   ② 纯附加、不改行为：logging 块、reward 的 dump_path / max_failure_ratio、
+#      模型路径改成本地权重、num_updates_per_batch: 1（参考配方没写这一项，靠 TrainStack
+#      的默认值 1；写出来只是让 NFT 的硬约束显式可见，取值与它等价）。
+#
+# 🚨 **不要为了省显存改 LoRA 设置**（rank / alpha / target_modules）。曾经想过换成
+#    GRPO baseline 的 attn-only 8 项（可训练参数 432.5M -> 196.6M，省约 2.7 GiB
+#    训练态），但那会偏离原始 NFT 配方、且让"容量"成为第二个变量。**现在的决定是
+#    LoRA 以原始配方为准，显存不够就降 spp / batch_size。**
+#
+# ⚠️ **clip_range 消失是个隐含变量**：qwen GRPO 用的是 1e-4（比 klein 的 5e-3 紧
+#    50 倍），而 baseline 实测 clip 在训起来后确实会触发（0.005->0.165）。换 NFT
+#    后这个约束整体不存在了。这不是我们选的，是算法差异 —— 但报结果时要说。
+#
+# ── ✅ 显存：**SMOKE 实测 60.7 GB/卡，余量 37 GB，不 OOM** ─────────────────────
+#   （下面留着推错的过程，因为那个错法很容易再犯：拿别的算法的实测值当基线。）
+#
+#   曾经的担心：Qwen-Image 的 **FlowGRPO** run 实测 ~93 GB/卡（384² + fbs=1 +
+#   activation_checkpointing），H20 97.8 GB → 余量只剩约 5 GB。而本配方按原始 NFT
+#   配方用 12 项 attn+mlp（r=64，60 层，d=3072，txt=3584）：
+#     可训练 adapter(default) 432.5M：权重 bf16 0.81 + 梯度 0.81 + Adam m/v 3.22 = 4.83 GiB
+#     影子 adapter(old)：只驻留权重、无梯度/优化器态                              = 0.81 GiB
+#     合计 ≈ 5.64 GiB > 5 GB 余量 → 推断"很可能 OOM"。
+#
+#   ✅ **2026-08-19 SMOKE 实测推翻了上面这个担心：只用 60.7 GB/卡，余量 37 GB，不 OOM。**
+#      错在拿 93 GB 当基线 —— 那是 **FlowGRPO** run 的值，含 GRPO 特有的 SDE 轨迹开销
+#      （num_sde_steps=3 + eta=0.7，要为每步存 log_prob）。**NFT 是前向过程方法、
+#      num_sde_steps=0，整条轨迹的 log_prob/激活都不用存**，省下的远多于双 adapter
+#      多出的 +3.1 GiB。所以 LoRA 与显存之间根本没有冲突。
+#      ⚠️ 但 SMOKE 是 batch_size=2 / spp=8，正式训练是 48/16（48 倍样本），rollout
+#         激活会涨，60.7 GB 不是正式训练的峰值 —— 首轮仍要看一眼。
+#      若真 OOM，按此顺序降，**不要动 LoRA 设置**（rank/alpha/target_modules 以原始
+#      配方为准，这是 2026-08-19 明确要求的）：
+#        ① rollout.forward_batch_size 已是 1 -> 不能再降
+#        ② sampling.samples_per_prompt 16 -> 8（改变 group 大小，是个变量，记台账）
+#        ③ batch_size 48 -> 32
+#        ④ 仍不行再考虑 fsdp_cfg.cpu_offload: true（会明显变慢）
+#      ⚠️ **不要为省显存把 384² 调低**，也不要调高（384² 本身已有撞画质地板的风险）。
+#
+# ── V3 severity 是什么 ──────────────────────────────────────────────────────
+# 内容类错误的 cost 改为「要求文本 vs 实际渲染文本」的归一化编辑距离；布局/风格类
+# 错误没有可比文本对，取 undefined_severity_cost。
+#   V2（severity + alpha 0.25）**已废弃且代码直接拒绝** —— remote.py 的
+#   __post_init__ 校验 exp(-alpha*17) >= 0.02，alpha=0.25 会 ValueError。
+#   V2 的 bug：judge 在「实际呈现」里把缺失的词再引一遍导致编辑距离为 0，
+#   48.6% 的错误代价归零、「整段没渲染」比「拼错一个字母」还便宜（目标反转）。
+#   已于 2026-08-09 在 qwen3vl_text_render.py 修复。启动脚本会硬校验这一点。
+#
+# ⚠️ **V3 的已知问题：会先涨后崩**（klein-9B 实测走了一条倒 U）：
+#     轮 1-85  n_errors 9.06 -> 8.52    缓慢改善
+#     轮 108-128        **4.78**        峰值，最佳 ckpt 是 checkpoint-120
+#     轮 236-256        **10.19**       比起点更差，之后 100+ 轮一直在这磨
+#   崩塌形态是「模型停止渲染」而不是「写错」：乱码标记 52.7% -> 3.2%，
+#   缺失标记 57.4% -> 96.7%。根因是 V3 对「不渲染」和「渲染成乱码」都收满额 1.0，
+#   于是"不画"成了躲开乱码错误的安全策略（V4 的 garbled_cost=0.85 就是修这个）。
+#   ⚒️ **所以：盯着峰值那一档存 checkpoint，别指望跑满 10000 轮。**
+#   ⚠️ 但 NFT 在 klein 上跑 86 轮未崩，本 run 是「NFT 是否能压住 V3 的崩塌」的
+#      第一个观测点 —— 崩了也是有用的负面结果，别回头调 garbled_cost。
+#
+# ── 数据（与 V1 那个 run 完全相同）────────────────────────────────────────────
+# datasets/text_degrade_l1_en_v3，脚本 scripts/merge_en_l1.py（可重跑，seed 42）。
+# **全部是 L1 层，已验证**：13487 条里 8759 条精确命中各 cache 的 `l1` 字段，
+# 命中 `l0`/`l2` 的为 0；余下 4728 条是 siqi 已建好的 l1，只做英文过滤未重降级。
+#     l1_en       4728  siqi 的 degrade_l1 里筛出英文渲染的（未重降级）
+#     judgeset_v2 2802  judge 集里她没降级过的英文 prompt（我们降级，取 l1 字段）
+#     upstream6k  5957  info_image_gen_v3 上游库（该库 52836 条英文 prompt 从未用过）
+# test 的 800 条**只从没有任何 run 见过的 prompt 里抽** —— 盲 shuffle 会把
+# l1_v1 的 train 行分进 test（实测 229 条），那样 test 就是脏的。
+#
+#                        n     串数   prompt字符  每串字符  >=4词串占比  中文%
+#   v1 老数据         10327    8.60      372      14.32     15.9%      0
+#   l1_v1（中英混）     9638    7.06      433      17.46     ~35%    51.8
+#   **本数据集**      12687    6.45      650      24.43     39.2%      0
+#
+# 🚨 「prompt 字符 372 -> 650」**不是变长了，是语言假象**：l1_v1 拆开是中文半 228 /
+#    英文半 652，中文单字信息密度高，字符数天然只有英文的 1/3。新数据的 650 ≈
+#    l1_v1 英文半的 652。
+# 🚨 **唯一真实变难的一维：串更长了。** 每串 14.3 -> 24.4 字符，>=4 词长串占比
+#    15.9% -> 39.2%。串数少 25% 但每串长 70%，judge 要查的渲染总字符净 +28%
+#    （123 -> 158）。⚒️ **起步 n_errors 未必更低；持平或更高是串长效应。**
+#
+# 🚨 **reward 绝对值不可与任何历史 run 比**：cost 定义变了（severity≠计数）**且**
+#    prompt 分布变了。**只能比 n_errors 和各自的相对趋势。**
+#    与配对的 V1 run 比也是如此 —— 那两个 run 的 reward 尺度不同，**唯一可比的
+#    是 n_errors**（都从 dump 算，都是 judge 报的原始错误条数）。
+#
+# ── judge：2026-08-19 新部署 http://28.59.81.108:8000（served id `zehan`）────
+#   PID 673111，TP=8 + enable_expert_parallel，max_model_len 16384，enforce_eager，
+#   gpu_memory_utilization 0.85，vLLM 0.20.0。**训练侧只需 REWARD_ENDPOINT /
+#   REWARD_MODEL_NAME 指对**（served id 是短名 `zehan`，不是权重路径；写错每个请求 404）。
+#
+#   ⚠️ 旧的 zehan endpoint 28.7.186.23:8000 **已死**（2026-08-19 探测 health=000）。
+#      别指回去 —— raise_on_failure=false 意味着 reward 会全变 nan 而**训练不报错**，
+#      等于白烧算力。
+#
+#   权重与旧 zehan 那台**逐字节相同**（已验证 model.safetensors.index.json、
+#   config.json、shard 00001/00050/00096 的 size+md5 全同），所以换 endpoint 换不到
+#   "不同的 reward model"，只换部署实例。同端点自我复现率仅 ~80%（temperature=0 也不
+#   确定，MoE+TP 数值不可复现），**别把端点差异当信号读**。
+#
+#   ✅ 实测新旧部署对比（n=128 配对，同图同 prompt，见 VIEWER_CKPT_MAP.md 顶部 tab）：
+#      reward 侧无实质差异 —— base 的 n_errors 3.20 -> 3.29（0.6×sem，不显著），
+#      且 NFT 的 Δreward 从 +0.1041(6.7×sem) 涨到 +0.1301(8.2×sem)，结论不受影响。
+#      box 定位准确率 **27.1% -> 84.7%**（置换对照 15.5% / 19.1%，n≈200 box）。
+#      box 不参与 reward（reward 只数错误条数），但让 dump 的框第一次可用于定位/debug。
+#
+# UNCHANGED and load-bearing：384²、12 步、lr 3e-4、LoRA r64/a128 attn-only、
+#   forward_batch_size 1、activation_checkpointing true、adv_use_global_std true、
+#   batch_size 48、seed 42、DanceSDE strategy（沿用 baseline，klein 的 NFT 配方
+#   也没动 strategy）。384² + fbs=1 是 54 GB 模型能塞进 H20 的原因。
+# ############################################################################
+#
+# Launch:
+#   SMOKE=1 bash Reward_UniRL_Train/run_train_qwen_nft_v3sev_l1en_20260819a.sh
+#   bash Reward_UniRL_Train/run_train_qwen_nft_v3sev_l1en_20260819a.sh
+# 命名规则见 Reward_UniRL_Train/NAMING_CONVENTION.md。
+
+num_devices: 8
+batch_size: 48
+adv_use_global_std: true      # NFT parity: ONE batch-wide std（qwen 配方本来就是）
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,diffusionrl}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_nft_v3sev_l1en_384_12st_20260819a}
+  entity: ${oc.env:WANDB_ENTITY,unix-ai-lab}
+  tags: ["qwen-image", "nft", "diffusionnft", "trainside", "v2", "qwen3vl-judge", "openai-chat", "severity-reward", "en-only-data"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/Qwen-Image-2512}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    # 与 qwen_image_nft.yaml 一致（FlowSDE）。GRPO 配方用的是 DanceSDE，但在
+    # **eta=0.0 下两者逐位相同** —— 实测 step() 的 prev_sample/mean/std_var 完全一致
+    # （只有 eta>0 才分叉：0.7 时 std_var 0.271 vs 0.221）：两个 step() 的公式体一样，
+    # 只有 _std_dev_t 不同，而它在 eta=0 时都返回 0。何况 DiffusionNFT 代码里压根
+    # 不引用 strategy / compute_log_prob（grep 无命中），且 num_sde_steps=0 时
+    # get_sde_indices() 返回空集，没有一步会走 SDE 分支。**换成它不改变数值行为。**
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true    # required: 0804 measured ~93 GB/card WITH it
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # NFT 改动 1/7：双 adapter EMA，**替代** GRPO 配方的 lora_cfg。
+  # 整块（含 target_modules 的 12 项 attn+mlp）**从 qwen_image_nft.yaml 逐字节复制**，
+  # 一个字都没动 —— LoRA 设置以原始 NFT 配方为准。
+  # ⚠️ 这意味着可训练参数是 432.5M（attn-only 会是 196.6M），比 GRPO baseline 的
+  #    LoRA 大一倍多。见文件头「显存」一节：Qwen 只剩 ~5 GB 余量，**必须先 SMOKE**；
+  #    真 OOM 时按文件头的顺序降 spp / batch_size，**不要动这一块**。
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1         # 已是最小值，OOM 时不能再往下降
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # REWARD_MODEL_NAME MUST match what /v1/models reports, or every request
+      # 404s. zehan's server reports the short id `zehan`; our own server has no
+      # --served-model-name so it reports the full weights PATH.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      # 0.1 — 与计数版相同，severity_weighting 不需要重新标定 alpha：加权后的
+      # cost 约为 0.93x len(errors)，尺度几乎不变；且优势会按组归一化，alpha 的
+      # 尺度在梯度里被约掉。太大反而饱和 exp()：0.25 时 p95 cost 17 映射到 0.014，
+      # 组内最差的样本互相不可分。
+      alpha: 0.1
+      # ── V3 severity（2026-08-09 修复版）：**本 run 与 V1 那个 run 的唯一差别** ──
+      # 内容类错误 cost = 「要求文本 vs 实际渲染文本」的归一化编辑距离；
+      # 布局/风格类错误没有可比文本对，取 undefined_severity_cost。
+      severity_weighting: true
+      undefined_severity_cost: 1.0
+      max_new_tokens: 8192        # 2026-08-23: 4096 会截断约 1% 的图（错误多的
+                                  # infographic 单张要 4000+ tokens），JSON 断在字符串
+                                  # 中间就解析失败。实测 193 张：4096 下 2 张失败，
+                                  # 8192 下 0 张。judge context 实为 16384（不是旧注释
+                                  # 说的 8192），1328² 图 prompt 仅 2288 token，余量充足。
+      temperature: 0.0
+      top_p: 1.0
+      request_concurrency: 32
+      batch_size: 32
+      timeout: 300.0
+      max_retries: 3
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      image_format: PNG
+      image_quality: 95
+      raise_on_failure: false
+      # n_errors 是唯一跨 reward 版本可比的尺子，只能从 dump 算 —— baseline
+      # 那个 run 没设 dump_path，它的 n_errors 轨迹至今拿不到。别再漏。
+      # V3 还需要 dump 来拆错误构成（缺失 / 乱码 / 部分正确），那是判断"是否在
+      # 走停止渲染的崩塌路径"的唯一依据。
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  # NFT 改动 7/7：FlowGRPO -> DiffusionNFT，且 clip_range 必须删除（NFT 无 ratio）。
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+  # DiffusionNFT loss 超参 —— 与两个既有 NFT 配方取值相同；DiffusionNFT.__init__
+  # 会校验（beta > 0、adv_clip_max > 0、adv_mode 必须 "raw"、train_timestep_mode
+  # 属于 {all, random}、training_timestep_fraction 在 (0,1]、kl_coef 与
+  # apply_time_shift_in_loss 必须保持 0.0 / false，否则抛 NotImplemented）。
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.99
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # NFT 改动 4/7：**必须是 1**。DiffusionNFT 继承 supports_multi_update=False
+  # （algorithms/base.py:371），TrainStack.__init__ 对 >1 直接抛错
+  # （train/stack/base.py:153）。这不是调参余地。
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/text_degrade_l1_en_v3/train.jsonl      # 12687 条全英文 L1
+      eval_data_path: datasets/text_degrade_l1_en_v3/test.jsonl  # 800 条留出（未被任何 run 训练过）
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.0                      # NFT 改动 2/7：前向过程方法，不注入 SDE 噪声
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false        # NFT 自己重加噪；组内共享噪声不需要（qwen 配方本来就是 false）
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0            # NFT 改动 2/7：前向过程，不记录 SDE 步
+    # NFT 改动 3/7：timestep_fraction 故意省略（默认 1.0）—— baseline 的
+    # [0, 0.5] 会预先限制 rollout 侧的时间步，而 NFT 要自己用
+    # train_timestep_mode / training_timestep_fraction 选。

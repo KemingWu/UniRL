@@ -100,6 +100,18 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
   leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
   all-reduce per optimizer step. VeOmni only supports `full`.
+- **A trainable param that never gets a gradient breaks checkpoint resume, so
+  `load_optimizer_state_dict` backfills it.** Adam creates `exp_avg`/`exp_avg_sq`
+  lazily on the first step, so a never-stepped param is absent from the saved
+  `state` while `param_groups` still lists it; torch's `_split_optim_state_dict`
+  then indexes `state[fqn]` for every `requires_grad` param and raises `KeyError`
+  — the checkpoint cannot resume at all. Real case: Qwen-Image's LoRA targets
+  include `attn.to_add_out`, which only feeds the text branch, and the
+  transformer discards the last block's `encoder_hidden_states`, so
+  `transformer_blocks.59.attn.to_add_out` gets no gradient by construction.
+  Backfilling zeros is exact rather than a fudge — zero moments at `step=0` is
+  precisely the state Adam holds for a param it has never stepped, and the param
+  keeps getting no gradient after the resume, so it stays frozen either way.
 
 ## Profiling → Perfetto
 

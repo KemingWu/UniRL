@@ -58,18 +58,29 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
+        max_failure_ratio: float = 0.0,
     ) -> None:
         super().__init__()
         self.backend = backend
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
+        # Fraction of per-sample reward failures tolerated per batch before aborting.
+        # 0.0 (default) keeps the historical strict behaviour: any failure raises.
+        # Generative-judge backends need slack — an LLM judge occasionally emits
+        # unparseable output, and killing a multi-thousand-rollout run over one bad
+        # sample in a batch is not a useful failure mode. Tolerated samples are
+        # neutralized (see score_and_attach), never scored as if they had succeeded.
+        self.max_failure_ratio = float(max_failure_ratio)
+        if not 0.0 <= self.max_failure_ratio < 1.0:
+            raise ValueError(f"max_failure_ratio must be in [0, 1), got {self.max_failure_ratio!r}")
         if self.truncated_reward not in ("zero", "keep", "soft"):
             raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
         logger.info(
-            "RewardService initialized with backend=%s, truncated_reward=%s",
+            "RewardService initialized with backend=%s, truncated_reward=%s, max_failure_ratio=%.3f",
             backend.get_model_name() or type(backend).__name__,
             self.truncated_reward,
+            self.max_failure_ratio,
         )
 
     @property
@@ -114,13 +125,34 @@ class RewardService(Remote):
         reward_response = self.compute_rewards(request)
 
         failed = [(i, e) for i, (ok, e) in enumerate(zip(reward_response.successes, reward_response.errors)) if not ok]
-        if failed:
+        n_total = len(reward_response.successes)
+        if failed and (n_total == 0 or len(failed) / n_total > self.max_failure_ratio):
             raise RuntimeError(
-                f"Reward computation flagged {len(failed)} of {len(reward_response.successes)} "
-                f"sample(s) as failure. First few: {failed[:3]}"
+                f"Reward computation flagged {len(failed)} of {n_total} "
+                f"sample(s) as failure (max_failure_ratio={self.max_failure_ratio}). "
+                f"First few: {failed[:3]}"
             )
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
+
+        if failed:
+            # Within tolerance: neutralize instead of aborting. Each failed sample
+            # takes the mean of the SUCCEEDED rewards, so its group-relative
+            # advantage is ~0 and it teaches nothing either way — as opposed to a
+            # hard 0.0, which a generative judge's random parse hiccup would turn
+            # into a strong "this image was terrible" signal.
+            ok_mask = torch.tensor(reward_response.successes, dtype=torch.bool)
+            fill = rewards[ok_mask].mean() if bool(ok_mask.any()) else torch.zeros((), dtype=torch.float32)
+            rewards[~ok_mask] = fill
+            logger.warning(
+                "RewardService: neutralized %d/%d failed sample(s) at reward=%.4f "
+                "(within max_failure_ratio=%.3f). First few: %s",
+                len(failed),
+                n_total,
+                float(fill),
+                self.max_failure_ratio,
+                failed[:3],
+            )
 
         sp = frontier.sampling_params
         if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:

@@ -107,6 +107,58 @@ GPU residency through the child's `onload`, `offload`, and `shutdown` endpoints;
 new remote reward needs no UniRL code — add it to the server and list its name in
 `RemoteRewardSpec.required_rewards`.
 
+## Generative-judge rewards (`_judges/`)
+
+`_judges/` holds one module per judge model: the instruction text that judge was
+trained on, plus the parser for its free-text reply. `OpenAIChatRewardBackend`
+(`remote.py`) uses them to talk straight to a fleet of vLLM
+`/v1/chat/completions` servers and score **client-side** — unlike
+`RemoteRewardBackend`, which delegates scoring to a RewardService server.
+
+`unirl-reward-service/reward_service/scorers/text_rendering_judge.py` keeps its
+own verbatim copy of the same contract so the two packages stay independent
+Python distributions. Change the judge's prompt format and both must be synced.
+
+### Gotchas
+
+- **`max_new_tokens` must be 8192, not 4096.** An error-dense infographic needs
+  4000+ tokens; 4096 truncated ~1% of images mid-JSON. The judge's real context
+  is 16384.
+- **A truncated reply can still parse.** `parse_errors`' third tier recovers the
+  last complete `{...}` before the cut, so a truncated answer scores as if it
+  were whole and every error after the cut vanishes with no trace in the dump.
+  Checking `finish_reason == "length"` is mandatory, not optional.
+- **`error_severity` returns `None`, never 0, when undefined.** It is defined only
+  for 内容正确性与完整性错误; layout/style errors compare a *relation*, not a
+  spelling. Callers must charge `None` a separate cost — a reported error that
+  scores 0 is invisible to GRPO.
+- **Severity gates on the declared category, not on "quotes on both sides."**
+  Layout/style descriptions do quote text on the requirement side
+  (原始要求【「Oil」位于表头行】/ 实际呈现【实际位于左侧列】) with nothing quoted on the
+  actual side. Reading that as "text is missing" scored a perfectly-rendered but
+  misplaced label at maximal severity, and left `undefined_severity_cost` dead.
+- **The 实际呈现 side is read by intent, not by first quoted run.** When text is
+  missing or garbled the judge names the string on *both* sides
+  (原始要求【出现文字「Meals」】/ 实际呈现【画面中未出现文字「Meals」】); differencing those
+  two quotes yields 0, which made the worst failure free while a one-letter typo
+  cost 0.2 — the gradient pointed the wrong way, on 48.6% of all errors in a
+  122k-sample dump. Order is 呈现为「X」 (grade it) → absent/garbled (maximal),
+  since one description can carry both markers.
+- **`weighted_error_cost` changes the reward scale, so rescale `alpha`.**
+  Severity ≤ 1 makes the cost strictly ≤ `len(errors)` — ~0.93x on a 122k-sample
+  klein-9B dump, since most content errors are absent-or-garbled (severity 1.0)
+  and only ~13% land strictly between 0 and 1.
+- **`garbled_cost` exists because equal costs reward drawing nothing.** With
+  "unreadable" and "never appeared" both at 1.0, omitting text is a safe way to
+  dodge a garble error: on a 263k-sample dump of `klein9b_severity_only_fixed`
+  the top reward quartile carried *more* fully-unrendered text than the bottom
+  (+2.9pp ± 1.4). At `garbled_cost=0.85` that flips to -15.9pp ± 1.4. `None`
+  (the default) keeps them equal, i.e. exact V3 behaviour.
+- **`max_failure_ratio` neutralizes, it does not zero.** Tolerated failures are
+  filled with the mean of the *succeeded* rewards, so their group-relative
+  advantage is ~0. Filling 0.0 would turn one random judge parse hiccup into a
+  strong "this image was terrible" signal.
+
 ## Gotchas
 
 - **A non-finite/missing reward fails the whole step, by design** — fix the scorer.

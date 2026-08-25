@@ -1,0 +1,247 @@
+# @package _global_
+# Qwen-Image + trainside rollout, FlowGRPO, severity-weighted Qwen3-VL judge reward.
+#
+# ############################################################################
+# THE VARIABLE UNDER TEST vs run 20260804_003730: the reward only.
+#   severity_weighting: false -> true   (+ undefined_severity_cost: 1.0)
+# Everything else is byte-identical to qwen_image_sglang_openai_reward.yaml,
+# INCLUDING clip_range=1.0e-4 — deliberately kept despite EXPERIMENTS.md
+# recommending 5e-3, so that this stays a single-variable comparison. If the
+# reward again refuses to move, clip_range is the next knob (and then it becomes
+# a second variable — record it).
+#
+# WHY severity: the count-based reward charges the same cost for a one-letter
+# typo and for text that never appeared at all. Measured on a 123k-sample
+# klein-9B dump: 78.5% of content errors are absent-or-garbled (severity 1.0),
+# so the weighted cost is only ~0.93x len(errors) — the SCALE barely moves, but
+# the pairwise reward-collision rate inside a group drops 45.2% -> 25.1%. That
+# collision rate is what GRPO actually consumes: two samples with equal reward
+# contribute zero advantage against each other.
+#
+# ⚠️ Requires the 2026-08-09 error_severity fix in
+#    unirl/reward/_judges/qwen3vl_text_render.py. Before it, the judge's habit of
+#    re-quoting the missing string on BOTH sides of "要求 X / 实际呈现 X" made the
+#    edit distance 0, so 48.6% of ALL errors cost NOTHING and "text absent" came
+#    out CHEAPER than a typo — the objective was inverted. That file is UNTRACKED
+#    in git and the training reads it live off CephFS. Verify before submitting:
+#      python -c "from unirl.reward._judges.qwen3vl_text_render import error_severity as s; \
+#                 print(s('要求「Chain」，实际未出现「Chain」'))"    # must be 1.0, not None
+#    See Reward_UniRL_Train/reward_design_iteration.md for the full history.
+#
+# ── inherited from run 20260804_003730 (46 rollouts, no checkpoints) ─────────
+# That run proved the chain works end to end on Qwen-Image (reward 0.39-0.49,
+# ~47 min/rollout, ~93 GB/card) but produced no usable result: reward drifted
+# -0.0053 over 46 rollouts, gn 3e-4 -> 6e-4, and nothing was saved. Two things
+# fixed here beyond the reward:
+#   - SAVE_DIR / SAVE_INTERVAL are wired by the launcher (0804 forgot them, so
+#     46 rollouts of compute were unrecoverable).
+#   - dump_path is set, so the error MIX is inspectable offline.
+#
+# UNCHANGED and load-bearing: 384² (not klein's 512²), 12 steps, lr 3e-4,
+# LoRA rank 64/alpha 128, forward_batch_size 1, activation_checkpointing true,
+# adv_use_global_std true, batch_size 48, DanceSDE, seed 42.
+# 384²+fbs=1 is what makes a 54 GB model fit on H20 96 GB — do not raise either
+# without re-measuring peak VRAM.
+# ############################################################################
+#
+# Launch (single train node x 8 GPU; judge runs as a SEPARATE vLLM service):
+#   REWARD_ENDPOINT=http://<judge-ip>:8000 \
+#   REWARD_MODEL_NAME=<served-model-id> \
+#   bash examples/run_experiment_multinode_taiji.sh \
+#     diffusion/qwen_image/qwen_image_textrender_severity \
+#     +save_interval=20 +save_mode=adapter +save_dir=<dir>
+#
+# taiji job submission: see Reward_UniRL_Train/train_deploy.md §十.
+
+num_devices: 8
+batch_size: 48
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,diffusionrl}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_textrender_severity}
+  entity: ${oc.env:WANDB_ENTITY,unix-ai-lab}
+  tags: ["qwen-image", "dancegrpo", "grpo", "sglang-diffusion", "v2", "qwen3vl-judge", "openai-chat", "severity-reward"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/Qwen-Image-2512}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true    # required: 0804 measured ~93 GB/card WITH it
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Single server (dev): set REWARD_ENDPOINT + REWARD_MODEL_NAME to that
+      # server's URL / served id. REWARD_MODEL_NAME MUST match what /v1/models
+      # reports, or every request 404s — a single-server vLLM without
+      # --served-model-name reports the full weights PATH, not "qwen3vl-judge".
+      # Cluster: set REWARD_ENDPOINTS_FILE and leave REWARD_ENDPOINT empty.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      # 0.1 — unchanged from the count-based run. severity_weighting does NOT
+      # need a rescaled alpha: the weighted cost is ~0.93x len(errors), and GRPO
+      # normalises advantages per group so alpha's scale cancels out of the
+      # gradient. Too LARGE saturates exp(): at 0.25 a p95 cost of 17 maps to
+      # 0.014 and a group's worst samples become indistinguishable.
+      alpha: 0.1
+      # ── severity weighting (the FIXED version, 2026-08-09) ──
+      # Content-error cost becomes the normalised edit distance between the
+      # required and the actually-rendered text. Layout/style errors have no
+      # comparable text pair and take undefined_severity_cost.
+      severity_weighting: true
+      undefined_severity_cost: 1.0
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Per-rank: 8 ranks × 32 = 256 in-flight. Do NOT cut this to silence
+      # timeout warnings — the smaller batch underfeeds the judge and costs ~50%
+      # throughput (measured 32/rank ≈ 13 min vs 8/rank ≈ 20 min on 1024 samples).
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a judgement genuinely takes minutes on a saturated server. An
+      # earlier 120s attempt made it WORSE (timeouts 4 → 44) by killing
+      # healthy-but-slow requests whose retries piled on more load.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge unparseable answers at temperature 0.3 — replaying at 0.0 would
+      # deterministically reproduce the same malformed output.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — JPEG artifacts can read as false rendering errors.
+      image_format: PNG
+      image_quality: 95
+      # false → a sample that exhausts HTTP retries becomes a per-sample failure
+      # marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio to work on transport failures; with the default `true`,
+      # ONE dead request out of 768 kills the run.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output to this JSONL.
+      # Empty = off, reward unchanged either way. Worth setting here — no
+      # Qwen-Image judge dump exists yet, so the error MIX (absent / garbled /
+      # typo / layout / style) is currently unknown for this model.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # 1e-4 is 50x tighter than klein's 5e-3 and EXPERIMENTS.md suspects it caps the
+  # 6x-larger lr. Kept anyway so the reward is the ONLY variable vs 20260804.
+  # Widen with algorithm.clip_range=5e-3 as the next experiment, not this one.
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl        # 10327 EN prompts, 170 seen classes
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl    # 870 held-out
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12
+  guidance_scale: 1.0           # CFG off (klein's CFG experiment is a separate run)
+  height: 384
+  width: 384
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

@@ -1,0 +1,46 @@
+# Text-Rendering Judge service configuration (Qwen3-VL-MoE-235B).
+#
+# Deploy on a dedicated 8-GPU node (TP=8 for the 235B judge).
+# The training node reaches this service over HTTP via
+# ``REWARD_SERVICE_URL=http://<this_node_ip>:8080``.
+#
+# Start (via 2-node launcher):
+#   ray start --head --port=6379 --num-gpus=8
+#   python -m reward_service --config configs/text_rendering_judge_service.yaml
+#
+# Deps (vLLM ≥ Qwen3-VL-MoE support) are installed by the launcher into the
+# base venv — not via Ray runtime_env (which is broken on the current image,
+# see SUBMITTING_JOBS.md §5).
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 600.0
+
+rewards:
+  - name: text_rendering_judge
+    scorer: text_rendering_judge
+    runtime_env: envs/text_rendering_judge.txt   # empty stub; deps in launcher
+    num_replicas: 1
+    num_gpus: 8                                    # whole node for TP=8
+    num_cpus: 32
+    max_concurrency: 1
+    params:
+      # ``__JUDGE_CKPT_PATH__`` is substituted by the launcher via `sed` at
+      # service startup — reward_service's yaml loader is plain
+      # ``yaml.safe_load`` and does not resolve ``${oc.env:...}``. See
+      # ``examples/diffusion/sd3/2node_jobs/launch_sd3_text_rendering_2node.sh``.
+      weights_path: __JUDGE_CKPT_PATH__
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.9
+      max_model_len: 14336         # matches judge_bench.py (10240 prompt + 4096 gen)
+      dtype: bfloat16
+      enforce_eager: true          # 235B: capture-graph memory would blow up
+      swap_space: 4
+      max_num_seqs: 32
+      trust_remote_code: true
+      limit_mm_per_prompt: {image: 1}
+      max_new_tokens: 4096
+      temperature: 0.0             # deterministic judge (paper default)
+      top_p: 1.0
+      alpha: 0.3                   # exp(-alpha * n_errors); n=0→1.0, n=3→0.41, n=5→0.22

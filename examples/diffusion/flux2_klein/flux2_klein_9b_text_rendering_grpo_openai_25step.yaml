@@ -1,0 +1,374 @@
+# @package _global_
+# FLUX.2-klein-base-9B GRPO — text-rendering reward via the Qwen3-VL-MoE-235B
+# judge (vLLM OpenAI-chat), on the English infographic prompt set.
+#
+# ############################################################################
+# 25-STEP VARIANT of flux2_klein_9b_text_rendering_grpo_openai.yaml.
+#
+# Adopts the SAMPLING knobs from Pref-GRPO's FLUX.2-klein script
+#   https://github.com/CodeGoat24/Pref-GRPO
+#   scripts/lora/lora_ur_flex_prefgrpo_flux2_klein.sh  (+ scripts/_common_finetune.sh)
+# That script targets a DIFFERENT codebase (FastVideo `train_flux2_klein.py`), so
+# its flags were mapped, not copied. What was taken and what was deliberately
+# REJECTED is recorded below — read this before "finishing the port".
+#
+#   ADOPTED (3 knobs, all under `sampling:`)
+#     --sampling_steps 25      ->  num_inference_steps: 10 -> 25
+#     --timestep_fraction 0.6  ->  timestep_fraction: [0, 0.5] -> [0, 0.6]
+#     --num_generations 9      ->  samples_per_prompt: 16 -> 9
+#   (Pref-GRPO's --eta 0.7 / --learning_rate 5e-5 / --init_same_noise /
+#    --max_grad_norm 1.0 / --lr_scheduler constant already match this recipe.)
+#
+#   REJECTED — each would break something here:
+#     --train_guidance_scale 4.0
+#         DANGEROUS. Klein has guidance_embeds=false, and guidance_scale > 1.0
+#         triggers a classical CFG combine at diffusion.py:185. The canonical
+#         Klein recipe is 1.0 with no negative branch (diffusion.py:82-87).
+#         Pref-GRPO can use 4.0 because it drives its own sampler. Kept at 1.0.
+#     --shift 3
+#         No-op here. Klein's checkpoint uses empirical-mu dynamic shifting; the
+#         static `shift` field is ignored at runtime (config.py:53-58).
+#     --clip_range 1e-4
+#         Kept at 5.0e-3. Klein sigmas skew to 1.0 and the PPO ratio drifts past
+#         1e-4 almost immediately — 5e-3 here was tuned, not guessed.
+#     --lora_rank 64 / --lora_alpha 128
+#         Kept at 16/32 ON PURPOSE so this run's delta vs the 10-step 9B baseline
+#         is attributable to STEP COUNT alone. Raising LoRA capacity at the same
+#         time would confound the ablation. Revisit as a separate experiment.
+#     --apply_gdpo / --rationorm / --kl_beta / --adv_clip_max /
+#     --reward_spec (unifiedreward_flex+clip) / --rollout_store_device cpu /
+#     --gradient_accumulation_steps / --weight_decay 1e-4 / --num_train_epochs
+#         No counterpart in this codebase (`rollout_store_device` appears nowhere
+#         under unirl/), or they belong to a different reward stack. Passing them
+#         would be a Hydra struct error.
+#
+# MEMORY — measured, not assumed. I first guessed 25 steps would triple the
+# trajectory cache; that was WRONG. Storage is driven by `num_sde_steps`
+# (unchanged at 3), NOT by num_inference_steps, because
+# types/sampling.py:compute_trajectory_positions keeps only the (x_t, x_{t+1})
+# pairs at SDE boundaries plus the final latent:
+#     10 steps / [0,0.5] / sde 3  ->  5 stored latent positions, 3 sde_logp
+#     25 steps / [0,0.6] / sde 3  ->  6 stored latent positions, 3 sde_logp
+# And samples_per_prompt 16 -> 9 REDUCES per-rollout memory. So this should fit
+# where the 10-step 9B run already fits (measured 67.8 GB of 97.8 GB per card).
+#
+# COST — the real price is compute: 25 steps is ~2.5x the rollout forward of 10.
+# The 10-step 9B run measured ~22 min/rollout with the judge as bottleneck;
+# expect ~30-40 min here. 9 samples instead of 16 cuts judge load per rollout by
+# ~44%, which partly offsets it.
+#
+# INVARIANT (planner/types.py:_update_ranges) — verified before writing:
+#     batch_size 64 x samples_per_prompt 9 = 576 global
+#     576 / 8 ranks = 72 per worker;  72 % num_updates_per_batch(2) == 0   OK
+# Do NOT "round up" batch_size: 72 x 9 gives 81/rank and FAILS after a full
+# rollout+reward pass (~30 min wasted).
+# ############################################################################
+#
+# Derived from flux2_klein_4b_text_rendering_grpo_openai.yaml by swapping ONLY
+# what the 9B checkpoint requires, then the 3 sampling knobs above. Every
+# reward / algorithm / data knob stays byte-identical to the 4B and 9B recipes.
+#
+# Verified against the real checkpoint at
+# /apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B
+# on 2026-08-04 (transformer/config.json + text_encoder/config.json + a
+# safetensors index key scan):
+#
+#   arch                    4B              9B (this recipe)
+#   ---------------------------------------------------------------
+#   dual blocks             5               8
+#   single blocks           20              24
+#   num_attention_heads     24              32
+#   attention_head_dim      128             128
+#   text encoder hidden     2560            4096   (both 36 layers)
+#   joint_attention_dim     7680            12288  (= 3 x hidden)
+#   transformer on disk     7.3 GB bf16     17 GB bf16
+#   text encoder on disk    7.5 GB bf16     16 GB bf16
+#   guidance_embeds         false           false
+#
+# ⚠️ CORRECTION to the sibling recipes' comments: flux2_klein_trainside.yaml says
+#    the 9B is "8 dual + 48 single / Qwen3-5120" and config.py says
+#    "3 * 5120 = 15360". THIS checkpoint measures 8 dual + 24 single, hidden 4096,
+#    joint_attention_dim 12288. Those comments describe a different (larger) 9B
+#    build than the one on zwfy8 — trust the numbers above, they came from the
+#    files. Nothing functional depends on the stale comments (block CLASS names
+#    and LoRA target names are architecture-shared), but do not size memory or
+#    extraction layers off them.
+#
+# All 13 LoRA target names below were confirmed present in the 9B safetensors
+# index (8 hits each for the dual-block targets, 24 for to_qkv_mlp_proj), so the
+# name-matched list carries over unchanged.
+#
+# Launch (single train node x 8 GPU; judge runs as a SEPARATE vLLM service):
+#   FLUX2_KLEIN_9B_PATH=... REWARD_ENDPOINT=... REWARD_MODEL_NAME=... \
+#   bash examples/run_experiment_multinode_taiji.sh \
+#     diffusion/flux2_klein/flux2_klein_9b_text_rendering_grpo_openai_25step
+#
+# ⚠️ MEMORY. The 10-step 9B run measured 67.8 GB/card of 97.8 GB at
+#    batch_size=64 / samples_per_prompt=16 / forward_batch_size=8 with
+#    param_dtype=fp32 and activation_checkpointing=true (both retained here).
+#    This variant should sit BELOW that: samples_per_prompt 16 -> 9 shrinks the
+#    per-rollout trajectory tensor, and going to 25 steps adds only one extra
+#    stored latent position (see the MEMORY block at the top — measured, not
+#    assumed). If it OOMs anyway, levers in order:
+#      forward_batch_size 9 -> 3   (still divides 9 evenly; group spans 3 chunks)
+#      meta_init_transformer: true (avoids the per-rank full-model load spike)
+#      param_dtype bf16            (LAST resort — Klein's empirical-mu schedule is
+#                                   numerically sensitive; bf16 master drifts
+#                                   reward after hundreds of rollouts)
+#
+#    Smoke (keep batch_size x samples_per_prompt / 8 divisible by
+#    num_updates_per_batch=2 — see Reward_UniRL_Train/train_deploy.md pitfall 2):
+#      ... batch_size=2 sampling.samples_per_prompt=8 num_rollouts=1
+#
+# NOTE on group chunking: with samples_per_prompt=9 and forward_batch_size=9 each
+# 9-sample GRPO group fits in ONE rollout-forward chunk — better than the 10-step
+# 9B recipe, which had to split 16-sample groups across two chunks at fbs=8.
+# (Splitting was safe there — init_same_noise holds because the group's initial
+# latent is driver-precomputed, not chunk-derived — but not splitting is simpler.)
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 × 9 samples = 576 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein9b-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,flux2klein9b_text_rendering_grpo_openai_25step}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["flux2-klein-9b", "grpo", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat", "25step"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    # Weights live on apdcephfs_zwfy8, NOT the original apdcephfs_hldy2 copy:
+    # hldy2 reads at 77 MB/s single-stream but collapses to ~1.3 MB/s per worker
+    # under 8-way concurrent load. zwfy8 reads at 1.4 GB/s. This matters MORE for
+    # the 9B than the 4B: 33 GB of weights per rank instead of 15 GB.
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_9B_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B}
+    model_precision: bf16
+    max_sequence_length: 512
+    # 3 extraction layers → 3 × 4096 = 12288 = transformer.joint_attention_dim (9B).
+    # Verified against this checkpoint. All < the 36-layer text encoder, so valid
+    # as-is — same indices as the 4B, which also has 36 layers.
+    qwen3_extraction_layers: [9, 18, 27]
+    # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
+    # shifting (build_schedule_policy) and this value is ignored at runtime.
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FLUX.2-klein transformer block classes (dual-stream + single-stream); match
+  # diffusers Flux2Transformer2DModel._no_split_modules. Same for 4B and 9B.
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # fp32 master — Klein's empirical-mu schedule is numerically sensitive; bf16
+    # master weights drift reward after ~hundreds of rollouts. Kept at fp32 for
+    # the 9B too: dropping to bf16 would be a second variable AND a known-bad one.
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # ON for the 9B (4B had it off "deliberately (speed)"). Recomputing block
+    # activations in backward is the cheapest large memory win available without
+    # touching the optimization math. Expect ~30% slower train step — irrelevant
+    # here, since the 4B run measured the judge, not the train step, as the
+    # bottleneck (15.7 min/rollout, GPUs at 0% util while awaiting reward).
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Name-matched (endswith) LoRA targets. Confirmed against the 9B safetensors
+    # index: every dual-block target resolves 8× (8 dual blocks) and
+    # to_qkv_mlp_proj resolves 24× (24 single blocks). Identical list to the 4B.
+    target_modules:
+      # DUAL block (Flux2TransformerBlock): image-stream attention
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      # DUAL block: text-stream attention (klein is dual-stream)
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      # DUAL block: image FFN + text FFN
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      # SINGLE block (Flux2SingleTransformerBlock): fused QKV+MLP linear
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # forward_batch_size must stay a divisor-friendly chunk of samples_per_prompt.
+  # 9 (== samples_per_prompt) keeps each GRPO group inside ONE chunk, which the
+  # 4B recipe wanted and the 10-step 9B recipe had to give up (it used 8 < 16).
+  # Dropping samples_per_prompt to 9 makes whole-group chunking affordable again.
+  # If this OOMs, lower to 3 (still divides 9 evenly, group spans 3 chunks).
+  forward_batch_size: 9
+
+# Reward: byte-identical to the 4B recipe — same judge, same alpha, same
+# concurrency. This is the controlled variable; do not tune it here or the
+# 4B-vs-9B comparison stops being single-variable.
+#
+# alpha=0.1 was calibrated on klein-4B's measured n_errors = 8..15. The 9B is a
+# stronger model and may well produce FEWER errors; if its rewards cluster near
+# the top of exp() (say n_errors < 4, reward > 0.67) the intra-group spread that
+# GRPO needs will shrink. Check the first ~20 rollouts' reward distribution and
+# recalibrate alpha if it is flat — but record it in EXPERIMENTS.md as a second
+# variable when you do.
+#
+# ⚠️ Throughput: ONE 8×H800 TP=8 judge is the RL bottleneck (4B measured 15.7
+#    min/rollout, ~13 of it pure reward latency). The 9B generates slower, so its
+#    rollout wall-clock will be worse. Judge-side metrics from the 4B run showed
+#    `Waiting: 0` on 99.1% of samples and KV cache at ~48% median — the client was
+#    UNDER-feeding the server, so raising request_concurrency is the cheap first
+#    fix. Left at 32 here to keep parity with the 4B baseline; change it in a
+#    dedicated throughput experiment, not in this one.
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Single server (dev): set REWARD_ENDPOINT + REWARD_MODEL_NAME to that
+      # server's URL / served id. REWARD_MODEL_NAME MUST match what
+      # /v1/models reports, or every request 404s — a single-server vLLM without
+      # --served-model-name reports the full weights PATH, not "qwen3vl-judge".
+      # Cluster: set REWARD_ENDPOINTS_FILE and leave REWARD_ENDPOINT empty.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      alpha: 0.1                  # see calibration note above (NOT the SD3 0.3)
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Per-rank: 8 ranks × 32 = 256 in-flight. Do NOT cut this to silence
+      # timeout warnings — the smaller batch underfeeds the judge and costs ~50%
+      # throughput (measured 32/rank ≈ 13 min vs 8/rank ≈ 20 min on 1024 samples).
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a 512² judgement genuinely takes minutes on a saturated server. An
+      # earlier 120s attempt made it WORSE (timeouts 4 → 44) by killing
+      # healthy-but-slow requests whose retries piled on more load.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge unparseable answers at temperature 0.3 — replaying at 0.0 would
+      # deterministically reproduce the same malformed output.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — JPEG artifacts can read as false rendering errors.
+      image_format: PNG
+      image_quality: 95
+      # false → a sample that exhausts HTTP retries becomes a per-sample failure
+      # marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio to work on transport failures; with the default `true`,
+      # ONE dead request out of 1024 kills the run.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output (description + box
+      # per error) to this JSONL. Empty = off, reward unchanged either way.
+      # The scalar reward keeps only len(errors), discarding the error type, the
+      # requirement-vs-actual pair and the box — analyse a dump with
+      # scripts/analyze_judge_errors.py before hand-tuning any finer-grained
+      # reward, so the weights come from measured distributions not guesses.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Loosened vs SD3's 1e-4 — Klein sigmas skew to 1.0 and the PPO ratio drifts fast.
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # per-worker batch = 64 × 9 / 8 = 72, divisible by 2. Keep this invariant when
+  # overriding batch_size / samples_per_prompt or the run dies AFTER a full
+  # rollout+reward pass (~30 min wasted) in planner/types.py:_update_ranges.
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl        # 10327 EN prompts, 170 seen classes
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl    # 870: 30 held-out classes + seen-class unseen-prompt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 25       # Pref-GRPO --sampling_steps 25 (was 10)
+  guidance_scale: 1.0           # NOT Pref-GRPO's 4.0 — see header (CFG combine + guidance_embeds=false)
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 9         # Pref-GRPO --num_generations 9 (was 16); keeps 64x9/8=72, 72%2==0
+  seed: 42
+  init_same_noise: true
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    # Unchanged at 3. This — not num_inference_steps — is what sets trajectory
+    # memory. Raising it is the lever if the GRPO signal turns out too sparse
+    # over 25 steps, but it costs memory linearly.
+    num_sde_steps: 3
+    # Pref-GRPO --timestep_fraction 0.6 (was [0, 0.5]). With 25 steps the SDE
+    # pool is [0, 15) — 15 candidate steps for the 3 SDE steps to land in,
+    # vs [0, 5) before.
+    timestep_fraction: [0, 0.6]

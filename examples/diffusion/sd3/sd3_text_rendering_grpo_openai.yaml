@@ -1,0 +1,170 @@
+# @package _global_
+# SD3.5-Medium GRPO — text-rendering reward via a *cluster* of Qwen3-VL-MoE-235B
+# judge servers (vLLM OpenAI-chat), decoupled from training.
+#
+# Same hyperparameters as ``sd3_text_rendering_grpo.yaml``; only the reward
+# backend differs:
+#   - ``sd3_text_rendering_grpo.yaml``  → RemoteRewardBackend + local reward_service
+#     (2-node job: Node 0 = reward, Node 1 = train)
+#   - THIS recipe                        → OpenAIChatRewardBackend + external
+#     Qwen3-VL judge cluster (1-node train job; reward runs in a separate
+#     ``qwen3vl_judge_cluster`` taiji job that publishes its endpoints to
+#     ``REWARD_ENDPOINTS_FILE`` on CephFS)
+#
+# See ``examples/diffusion/sd3/2node_jobs/launch_sd3_text_rendering_openai_1node.sh``
+# for the taiji entrypoint and ``launch_qwen3vl_judge_cluster.sh`` for the
+# reward-cluster launcher.
+
+num_devices: 8                  # 1 node × 8 H20 for training
+batch_size: 48                  # prompts_per_rollout (48 × 16 samples = 768/rollout)
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sd3-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,sd3_text_rendering_grpo_openai}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["sd3.5", "grpo", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,/apdcephfs_hldy/share_305110755/hunyuan/public_models/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 8
+
+# Reward: HTTP client to an external cluster of vLLM /v1/chat/completions
+# servers running Qwen3-VL-MoE-235B. Endpoints are read at startup from
+# REWARD_ENDPOINTS_FILE — one URL per line, populated by the reward-cluster
+# launcher (see launch_qwen3vl_judge_cluster.sh).
+#
+# alpha=0.3 matches the local reward_service configuration:
+#   n=0 → 1.0, n=1 → 0.741, n=3 → 0.407, n=5 → 0.223
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE}
+      model: qwen3vl-judge
+      alpha: 0.3
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      request_concurrency: 32
+      batch_size: 32
+      timeout: 300.0
+      max_retries: 3
+      image_format: JPEG
+      image_quality: 95
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 8
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/infographic_medium/train.jsonl
+      eval_data_path: datasets/infographic_medium/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    num_sde_steps: 3

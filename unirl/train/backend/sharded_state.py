@@ -86,6 +86,44 @@ def gather_lora_state_dict(model: nn.Module) -> StateDict:
     return gathered
 
 
+def _backfill_stepless_optimizer_state(model: nn.Module, state_dict: StateDict) -> None:
+    """Give params listed in ``param_groups`` but absent from ``state`` a zero state (see unirl/train/readme.md)."""
+    state = state_dict.get("state")
+    param_groups = state_dict.get("param_groups")
+    if not isinstance(state, dict) or not isinstance(param_groups, list):
+        return
+
+    reference = next((v for v in state.values() if isinstance(v, dict) and "exp_avg" in v), None)
+    if reference is None:  # nothing stepped yet, or a non-Adam optimizer — leave it alone
+        return
+    step_ref = reference.get("step")
+    params = dict(model.named_parameters())
+
+    for group in param_groups:
+        if not isinstance(group, dict):
+            continue
+        for fqn in group.get("params", []) or []:
+            if not isinstance(fqn, str) or fqn in state:
+                continue
+            param = params.get(fqn)
+            if param is None:
+                continue  # not ours to invent — let torch report the real mismatch
+            # Shaped from the model's own param: lora_A/lora_B are transposes, so a
+            # sibling's saved moment is not a usable template.
+            moment = torch.zeros(param.shape, dtype=reference["exp_avg"].dtype, device="cpu")
+            entry: Dict[str, object] = {"exp_avg": moment, "exp_avg_sq": moment.clone()}
+            if isinstance(step_ref, torch.Tensor):
+                entry["step"] = torch.zeros_like(step_ref)
+            elif step_ref is not None:
+                entry["step"] = 0
+            state[fqn] = entry
+            logger.warning(
+                "load_optimizer_state_dict: %r is listed in param_groups but has no saved "
+                "optimizer state (it never received a gradient); backfilling a zero state.",
+                fqn,
+            )
+
+
 def load_optimizer_state_dict(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -95,6 +133,8 @@ def load_optimizer_state_dict(
 ) -> None:
     """Load a full optimizer state dict and reshard it into ``optimizer``."""
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+    _backfill_stepless_optimizer_state(model, state_dict)
 
     options = _build_state_dict_options(
         full_state_dict=True,

@@ -1,0 +1,275 @@
+# @package _global_
+# 🛑 **已被取代，不要用。** 保留仅为记录当天的中间产物。
+#    这是 FlowGRPO 版；用户 2026-08-19 决定两个 run 都走 NFT，替代品是：
+#      qwen_image_nft_v1cnt_l1en_384_12st_20260819a.yaml   （V1 计数）
+#      qwen_image_nft_v3sev_l1en_384_12st_20260819a.yaml   （V3 severity）
+#    ⚠️ **2026-08-23 更正：本文件 8/22 实际启动过了**（原注释「从未启动过（无 ckpt、
+#    无 log、无 wandb run）」已被推翻）。13:26 起跑，18:37 崩，到 rollout 14/10000，
+#    只有 checkpoint-1（save_interval=20 没到）；log 与 judge dump 在
+#    Reward_UniRL_Train/logs/ 下 *_20260822_132652.*。
+#    💥 崩溃原因：judge 输出被 max_new_tokens=4096 截断，6/96 样本解析失败，
+#       超过 max_failure_ratio=0.05 直接 abort。**8/23 已把 max_new_tokens 提到 8192
+#       并加了 finish_reason=="length" 截断检测**，这个坑修掉了。
+#    📊 那 11446 条 dump 的错误构成：畸形 43.9% / 字体 16.7% / 缺失 16.5% /
+#       拼错 15.8%；n_errors 均值 7.08，0 错率仅 0.5%。
+#       ⚠️ 曾据此怀疑「384² 撞画质地板」，但 8/23 的分辨率扫描否掉了这个归因
+#       （768² 下畸形率仍 44.6%，几乎不变）—— 真正的瓶颈是 **12 步 + cfg 1.0**。
+#       扫描数据见 qwen_image_v1cnt_l1en_512_12st_20260823a.yaml 头部。
+#    若确实需要「GRPO + l1en」那一格（用于接回 qwen_image_baseline），可以用本文件，
+#    但要按 NAMING_CONVENTION.md 重新起名并记台账。
+# Qwen-Image + trainside rollout, FlowGRPO, **V1 计数 reward** + **全英文 l1 数据**。
+#
+# ############################################################################
+# 相对 qwen_image_sglang_openai_reward.yaml（= 已跑的 `qwen_image_baseline`）：
+# **只换数据**。reward/算法/模型/采样/LoRA/lr/clip 全部逐字节相同。
+#   datasets/rl_flux2klein_v1/*  ->  datasets/text_degrade_l1_en_v3/*
+#
+# ✅ **这一格正是之前缺的 2x2 单变量对照**：
+#   qwen_image_v3severity_l1 同时换了 reward(V1->V3) 和数据(v1->l1)，两个变量，
+#   无法归因。本 run 固定 reward=V1 只换数据，补上「V1 + l1」这一格：
+#
+#            |  rl_flux2klein_v1        |  l1 降级数据
+#   ---------|--------------------------|---------------------------
+#   V1 计数  |  qwen_image_baseline ✅  |  **本 run** ✅
+#   V3 sever |  qwen_tr_sev_0811a ✅    |  qwen_image_v3severity_l1 ✅
+#
+# 🚨 **但「只换数据」这句话里，数据本身变了三样东西** —— 归因时必须一起说：
+#   ① 文字负载：8.62 串 -> 6.45 串（都在 1024 eval 实测的收益区 4-14 内）
+#   ② 语言：rl_flux2klein_v1 是纯英文，text_degrade_l1_v1 是中英各半，
+#      本数据集**筛回了纯英文**（渲染串无 CJK **且** 描述正文 CJK 占比 <=5%）。
+#      所以相对 v1 语言维度没变，相对 l1_v1 变了 —— 别和 l1_v1 的 run 比。
+#      实测中文比英文难：n_errors 8.29 vs 6.50，完美率 0.1% vs 3.1%。
+#   ③ 规模：9638 -> 12687（1.3x）。epoch 长度变了，同 rollout 数下重复度更低。
+#
+# ── 实测三集对照（2026-08-19 复算，train split）─────────────────────────────
+#                        n     串数   prompt字符  每串字符  >=4词串占比  中文%
+#   v1 老数据         10327    8.60      372      14.32     15.9%      0
+#   l1_v1（在跑的）     9638    7.06      433      17.46     ~35%    51.8
+#   **本数据集**      12687    6.45      650      24.43     39.2%      0
+#
+# 🚨 **「prompt 字符 372 -> 650」不是变长了，是语言假象。** 把 l1_v1 拆开看：
+#      中文那半 228 字符 / 英文那半 **652** 字符
+#    中文单字信息密度高，字符数天然只有英文的 1/3，是它把 l1_v1 的均值压到 433。
+#    新数据集的 650 ≈ l1_v1 英文半的 652 —— 长度这一维相对 l1 其实**没变**，
+#    只是中文样本移除后露出了英文的真实长度。相对 v1 的 1.7x 在换到 l1 时就
+#    已经发生，不是本次引入的。
+#
+# 🚨 **唯一真实变难的一维：串更长了**（这条会影响怎么读 n_errors）
+#    每串 14.3 -> 24.4 字符，>=4 词的长串占比 15.9% -> 39.2%。
+#    串数少了（8.60 -> 6.45）但每串长了 70%，两者部分抵消 —— judge 要逐条查的
+#    **渲染总字符**只从 123 涨到 158（+28%），不是按串数比例下降。
+#    长串更容易"前半段渲染对、后半段崩"，而 judge 一个词错就记一个 error。
+#    ⚒️ **所以起步 n_errors 未必比 v1 时代低。若持平甚至更高，那是串长效应，
+#       不要读成"数据变难了"** —— 要判断得看 dump 的错误构成（缺失/乱码/部分对）。
+#
+# ⚠️ 低负载档(1-3 串)占 24.6%（3126 条），按 1024 eval 的倒 U 收益曲线这一档
+#    LoRA 改善空间小，等于 1/4 算力花在低产出样本上。**故意没剔** —— 剔了就
+#    多一个变量，且 l1_v1 的 run 没剔、之后不可比。要剔另开一个 run 记台账。
+#    收益区(4-14 串) 占比 71.4%，与 l1_v1 的 71.3% 一致。
+#
+# 🚨 **reward 绝对值不可与 qwen_image_baseline 比**：prompt 分布换了（与
+#   rl_flux2klein_v1 零重合，实测）。cost 定义没变（都是计数版 alpha=0.1），
+#   所以 **n_errors 是可比的尺子**，reward 均值不是。
+#
+# 数据构建：datasets/text_degrade_l1_en_v3/split_info.json，脚本
+#   scripts/merge_en_l1.py（可重跑，split seed 42）。三个池子**零重合**（实测），
+#   **全部是 L1 层**（已验证：13487 条里 8759 条精确命中各 cache 的 `l1` 字段，
+#   命中 `l0`/`l2` 的为 0；余下 4728 条是 siqi 已建好的 l1，只做了英文过滤）：
+#     l1_en       4728  siqi 的 text_rendering_judge_degrade_l1 筛出英文渲染的（未重降级）
+#     judgeset_v2 2802  judge 集里她没降级过的英文 prompt（我们降级，取 l1 字段）
+#     upstream6k  5957  info_image_gen_v3 上游库（该库 52836 条英文 prompt 从未用过）
+#   降级用 scripts/degrade_en_prompts.py，它**import** siqi 的 SYSTEM_PROMPT /
+#   validate（不是复制），所以 L1 定义逐字节相同：保留主标题+核心主体+最重要的
+#   一两个 section，砍正文和次级标签，长度 <=原 prompt 的 30%（validate 硬卡）。
+#   实测三池串数 6.66 / 6.58 / 6.22 一致，印证同分布。
+#   唯一比 siqi 多的一步：降级出的 l1 若渲染串不是纯英文就重试/丢弃。
+#
+#   test 的 800 条**只从没有任何 run 见过的 prompt 里抽** —— 盲 shuffle 会把
+#   l1_v1 的 train 行分进 test（实测 229 条），那样 test 就是脏的。
+#
+# ⚠️ judge 默认走 zehan 的 endpoint（28.7.186.23:8000，served id 就叫 `zehan`）。
+#   与我们自建的 28.59.81.108 是**同一份权重**（439G，分片1 前 200MB md5 相同）、
+#   指令前 629 字符逐字节一致 —— 换 endpoint 换不到"不同的 reward model"，只换
+#   部署实例。⚠️ 但同端点自我复现率仅 80%（temperature=0 也不确定，MoE+TP 数值
+#   不可复现），所以**别把 endpoint 差异当信号读**。
+#   zehan 是别人 taiji 作业的节点，作业结束 IP 立即失效 -> reward 全 nan。
+#
+# UNCHANGED and load-bearing（继承自 baseline，全部不要动）：
+#   384²（不是 klein 的 512²）、12 步、lr 3e-4、LoRA r64/a128、
+#   forward_batch_size 1、activation_checkpointing true、adv_use_global_std true、
+#   batch_size 48、DanceSDE、seed 42、clip_range 1.0e-4。
+#   384² + fbs=1 是 54 GB 模型能塞进 H20 96 GB 的原因 —— 两个都别调大。
+# ############################################################################
+#
+# Launch（单训练节点 x 8 GPU；judge 是**独立**的 vLLM 服务）：
+#   bash Reward_UniRL_Train/run_train_qwen_image_v1_en.sh
+# 或手动：
+#   REWARD_ENDPOINT=http://28.7.186.23:8000 REWARD_MODEL_NAME=zehan \
+#   REWARD_DUMP_PATH=<dump.jsonl> \
+#   bash examples/run_experiment_multinode_taiji.sh \
+#     diffusion/qwen_image/qwen_image_v1cnt_l1en_384_12st_20260819a \
+#     +save_interval=20 +save_mode=adapter +save_dir=<dir>
+
+num_devices: 8
+batch_size: 48
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,diffusionrl}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_v1cnt_l1en_384_12st_20260819a}
+  entity: ${oc.env:WANDB_ENTITY,unix-ai-lab}
+  tags: ["qwen-image", "dancegrpo", "grpo", "sglang-diffusion", "v2", "qwen3vl-judge", "openai-chat", "en-only-data"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/Qwen-Image-2512}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true    # required: 0804 measured ~93 GB/card WITH it
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # REWARD_MODEL_NAME MUST match what /v1/models reports, or every request
+      # 404s. zehan's server reports the short id `zehan`; our own server has no
+      # --served-model-name so it reports the full weights PATH.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      # V1 计数版：reward = exp(-alpha * len(errors))。severity_weighting 留默认
+      # false —— **这一行的缺席就是本 run 是 V1 而不是 V3 的全部原因**，别顺手加。
+      alpha: 0.1
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      request_concurrency: 32
+      batch_size: 32
+      timeout: 300.0
+      max_retries: 3
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      image_format: PNG
+      image_quality: 95
+      raise_on_failure: false
+      # n_errors 是唯一跨 reward 版本可比的尺子，只能从 dump 里算 —— baseline
+      # 那个 run 没设 dump_path，所以它的 n_errors 轨迹至今拿不到。别再漏。
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/text_degrade_l1_en_v3/train.jsonl      # 12687 条全英文 l1
+      eval_data_path: datasets/text_degrade_l1_en_v3/test.jsonl  # 800 条留出（未被任何 run 训练过）
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

@@ -1,0 +1,290 @@
+# @package _global_
+# FLUX.2-klein-base-9B GRPO — CFG ON during training, severity-weighted reward.
+#
+# ############################################################################
+# THE VARIABLE UNDER TEST: guidance_scale 1.0 -> 4.0 (classifier-free guidance).
+#
+# Derived from flux2_klein_9b_textrender_severity_only.yaml (the FIXED severity
+# reward, alpha=0.1). Reward config is byte-identical to it, so a comparison
+# against that run isolates CFG. Verify the reward never drifts:
+#     diff <(sed -n '/^reward:/,/^algorithm:/p' flux2_klein_9b_textrender_severity_only.yaml) \
+#          <(sed -n '/^reward:/,/^algorithm:/p' flux2_klein_9b_cfg_textrender_severity.yaml)
+# Expected: no output.
+#
+# WHY: every klein run so far trained at guidance_scale=1.0, which for Klein
+# means CFG is genuinely OFF (see below) — the model does RL on a low-quality
+# sampling distribution. Measured consequence: the training distribution carries
+# n_errors ~9.1, vs ~6.7 on the eval distribution (512²/50st/g=4.0). In the V3
+# severity dump, 78.5% of content errors score a full 1.0 severity, of which
+# ~45% are "text entirely absent" and ~30% "garbled" — floor-level failures
+# where nothing legible was rendered at all. A finer reward cannot separate
+# samples that all failed to render text. Turning CFG on raises the sampling
+# floor so there IS something for RL to improve.
+#
+# The eval-side evidence for the same effect (eval_viewer_deploy.md §六):
+# switching eval from g=1.0/10st to g=4.0/50st moved klein-4B from
+# Δreward +0.0060 (not significant, 50% ties) to +0.0159 (significant, 31% ties)
+# using 1/3 the samples. That was eval-only; this recipe tests it in TRAINING.
+#
+# ── g=1.0 really is "CFG off", not "ignored" ─────────────────────────────────
+# The baseline recipes annotate guidance_scale: 1.0 as "guidance_embeds=False →
+# ignored". That annotation is WRONG and eval_viewer_deploy.md §六 already
+# corrected it. Two independent things:
+#   - `guidance_embeds: False` (Klein-9B) → the DISTILLED guidance embedding is
+#     unused; diffusion.py feeds `guidance=torch.zeros(B)`. This is what is
+#     truly ignored.
+#   - `guidance_scale` → drives the CLASSICAL CFG combine at
+#     flux2_klein/diffusion.py:185: `if guidance_scale > 1.0:` then run the
+#     negative branch and combine `neg + g*(cond - neg)`. At 1.0 this branch is
+#     skipped entirely, so CFG is OFF by choice, not by model limitation.
+#
+# ── negative prompt: nothing to configure ────────────────────────────────────
+# Flux2KleinPipeline.build_conditions (pipeline.py:236) auto-creates empty-string
+# negatives when guidance_scale > 1.0 and none were supplied:
+#     if negatives is None and float(guidance_scale) > 1.0:
+#         negatives = Texts(texts=[""] * len(texts.texts))
+# So setting guidance_scale here is sufficient — `negative_text` is a transported
+# CONCAT field on Flux2KleinConditions, so it reaches the training side too and
+# the loss forward applies the same CFG combine (predict_noise_at_step passes
+# params.guidance_scale straight through). CFG is therefore consistent between
+# rollout and training; there is no train/inference mismatch.
+#
+# ⚠️ COST: ~2x. CFG runs a second transformer forward per step, in BOTH the
+#    rollout and the training loss. The 9B severity run measured 21.9 min/rollout
+#    at g=1.0; expect roughly 35-45 min/rollout here (generation doubles, judge
+#    latency is unchanged). Budget accordingly before starting a long run.
+#
+# ⚠️ MEMORY: the uncond forward is a SEPARATE sequential transformer call
+#    (diffusion.py:190, not a batched cond/uncond concat), so the activation peak
+#    should not double — the extra cost is one more text-embed tensor per sample
+#    (negative_text). Still UNVERIFIED on 9B at forward_batch_size 8. SMOKE FIRST;
+#    if it OOMs, drop rollout.forward_batch_size 8 -> 4 before anything else.
+#
+# ⚠️ g=4.0 IS A GUESS, matched to the eval parameters so the training and eval
+#    distributions line up. It is NOT calibrated for training. Klein's official
+#    inference default is 4.0 and the eval runs used 4.0, which is the only
+#    reason to prefer it over 2.0 or 7.0. If reward collapses or images look
+#    over-saturated, g is the first knob — and then it becomes a second variable,
+#    so record it.
+#
+# UNCHANGED from the severity recipe: reward (severity_weighting, alpha=0.1),
+# bundle/pipeline, FSDP (param_dtype fp32), lr 5e-5, 10 inference steps, 512²,
+# batch_size 64, samples_per_prompt 16, forward_batch_size 8, micro_batch_size 1,
+# num_updates_per_batch 2, eta 0.7, num_sde_steps 3, timestep_fraction [0,0.5],
+# the dataset, and seed 42 (same prompt order as every other klein run).
+# ############################################################################
+#
+# Smoke (~10 min at 2x cost, do this before any long run):
+#     batch_size=2 sampling.samples_per_prompt=8 num_rollouts=1
+#   per_worker = 2*8/8 = 2, divisible by num_updates_per_batch=2. Do NOT use
+#   samples_per_prompt=4 (per_worker=1, 1%2=1 fails AFTER a full rollout+reward).
+#
+# Launch / job submission: see Reward_UniRL_Train/train_deploy.md (§三 / §十).
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 × 16 samples = 1024 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein9b-text-rendering}
+  run_name: ${oc.env:WANDB_RUN_NAME,flux2klein9b_cfg_textrender_severity}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["flux2-klein-9b", "grpo", "trainside", "text-rendering", "qwen3vl-judge", "openai-chat", "severity-reward", "cfg-on"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_9B_PATH,/apdcephfs_zwfy8/share_305110755/kemingwu/hf_home/models/FLUX.2-klein-base-9B}
+    model_precision: bf16
+    max_sequence_length: 512
+    qwen3_extraction_layers: [9, 18, 27]
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: fp32           # Klein's empirical-mu schedule is numerically sensitive
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 8         # drop to 4 first if CFG makes this OOM
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Tolerate rare unparseable judge outputs; tolerated samples are filled with
+  # the batch's succeeded-reward mean (≈0 advantage) rather than a spurious
+  # "terrible image" signal. Above 5% we abort — that is a real service problem.
+  max_failure_ratio: 0.05
+  backend:
+    _target_: unirl.reward.remote.OpenAIChatRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.OpenAIChatRewardSpec
+      # Single server (dev): set REWARD_ENDPOINT + REWARD_MODEL_NAME to that
+      # server's URL / served id. REWARD_MODEL_NAME MUST match what
+      # /v1/models reports, or every request 404s — a single-server vLLM without
+      # --served-model-name reports the full weights PATH, not "qwen3vl-judge".
+      # Cluster: set REWARD_ENDPOINTS_FILE and leave REWARD_ENDPOINT empty.
+      endpoints: ["${oc.env:REWARD_ENDPOINT,}"]
+      endpoints_file: ${oc.env:REWARD_ENDPOINTS_FILE,}
+      model: ${oc.env:REWARD_MODEL_NAME,qwen3vl-judge}
+      # 0.1 — same as the count-based baseline. severity_weighting does NOT need
+      # a rescaled alpha: the weighted cost is ~0.92x len(errors) (measured on a
+      # 123k-sample dump), and GRPO normalises advantages per group so alpha's
+      # scale cancels out of the gradient anyway. Too LARGE saturates exp():
+      # at 0.25 a p95 cost of 17 maps to 0.014 and 3% of samples fall under 0.01,
+      # so a group's worst samples become mutually indistinguishable.
+      # See Reward_UniRL_Train/reward_design_iteration.md for the full history.
+      alpha: 0.1
+      # ── severity weighting (the FIXED version, 2026-08-09) ──
+      # Content-error cost becomes the normalised edit distance between the
+      # required and the actually-rendered text, so a one-letter typo costs less
+      # than a garbled title. Layout/style errors have no comparable text pair
+      # and take undefined_severity_cost.
+      # ⚠️ Requires the 08-09 error_severity fix: before it, the judge's habit of
+      # re-quoting the missing string on BOTH sides made the edit distance 0, so
+      # 48.6% of ALL errors cost NOTHING and "text absent" was cheaper than a
+      # typo — the objective was inverted.
+      severity_weighting: true
+      undefined_severity_cost: 1.0
+      max_new_tokens: 8192        # 2026-08-23: 4096 truncates ~1% of images (a dense
+                                  # infographic needs 4000+ tokens); the JSON breaks
+                                  # mid-string and fails to parse. Measured on 193
+                                  # images: 2 failures at 4096, 0 at 8192. The judge
+                                  # context is really 16384 (not 8192 as older comments
+                                  # said); a 1328² image prompt is only 2288 tokens.
+      temperature: 0.0
+      top_p: 1.0
+      # Per-rank: 8 ranks × 32 = 256 in-flight. Do NOT cut this to silence
+      # timeout warnings — the smaller batch underfeeds the judge and costs ~50%
+      # throughput (measured 32/rank ≈ 13 min vs 8/rank ≈ 20 min on 1024 samples).
+      request_concurrency: 32
+      batch_size: 32
+      # 300s: a 512² judgement genuinely takes minutes on a saturated server. An
+      # earlier 120s attempt made it WORSE (timeouts 4 → 44) by killing
+      # healthy-but-slow requests whose retries piled on more load.
+      timeout: 300.0
+      max_retries: 3
+      # Re-judge unparseable answers at temperature 0.3 — replaying at 0.0 would
+      # deterministically reproduce the same malformed output.
+      parse_retries: 3
+      parse_retry_temperature: 0.3
+      # PNG (lossless) — JPEG artifacts can read as false rendering errors.
+      image_format: PNG
+      image_quality: 95
+      # false → a sample that exhausts HTTP retries becomes a per-sample failure
+      # marker instead of an exception that aborts the batch. Required for
+      # max_failure_ratio to work on transport failures; with the default `true`,
+      # ONE dead request out of 1024 kills the run.
+      raise_on_failure: false
+      # Observational: append the FULL parsed judge output to this JSONL.
+      # Empty = off, reward unchanged either way. For a CFG run this is worth
+      # setting — the whole hypothesis is that CFG shifts the ERROR MIX away from
+      # "text entirely absent", and only a dump can show that.
+      dump_path: ${oc.env:REWARD_DUMP_PATH,}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/rl_flux2klein_v1/train.jsonl        # 10327 EN prompts, 170 seen classes
+      eval_data_path: datasets/rl_flux2klein_v1/test.jsonl    # 870: 30 held-out classes + seen-class unseen-prompt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  # ── THE VARIABLE UNDER TEST ──
+  # 4.0 turns the classical CFG combine ON (diffusion.py:185). The pipeline
+  # auto-supplies empty-string negatives (pipeline.py:236), so nothing else needs
+  # configuring. Costs a 2nd transformer forward per step in rollout AND loss.
+  guidance_scale: 4.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42                      # same prompt order as every other klein run
+  init_same_noise: true
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]
